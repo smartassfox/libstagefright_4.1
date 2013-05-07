@@ -25,6 +25,10 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/hexdump.h>
 #include <media/stagefright/MediaErrors.h>
+#define WRITE_FILE 0
+#if WRITE_FILE
+static FILE * aacFp = NULL;
+#endif
 
 namespace android {
 
@@ -50,10 +54,21 @@ SoftAAC::SoftAAC(
       mUpsamplingFactor(2),
       mAnchorTimeUs(0),
       mNumSamplesOutput(0),
+      mUseFaadDecoder(0),
+      hAac(NULL),
+      conf(NULL),
       mSignalledError(false),
       mOutputPortSettingsChange(NONE) {
     initPorts();
     CHECK_EQ(initDecoder(), (status_t)OK);
+#if WRITE_FILE
+    ALOGE("create file: /sdcard/aac.dat");
+    aacFp = fopen("/sdcard/aac.dat","wb");
+    if(aacFp)
+        ALOGE("------>>create file success");
+    else
+        ALOGE("------>>create file fail");
+#endif
 }
 
 SoftAAC::~SoftAAC() {
@@ -62,6 +77,14 @@ SoftAAC::~SoftAAC() {
 
     delete mConfig;
     mConfig = NULL;
+	if(mUseFaadDecoder == 1 && hAac != NULL)
+		NeAACDecClose(hAac);
+#if WRITE_FILE
+    if(aacFp) {
+        fclose(aacFp);
+        aacFp = NULL;
+    }
+#endif
 }
 
 void SoftAAC::initPorts() {
@@ -72,7 +95,7 @@ void SoftAAC::initPorts() {
     def.eDir = OMX_DirInput;
     def.nBufferCountMin = kNumInputBuffers;
     def.nBufferCountActual = def.nBufferCountMin;
-    def.nBufferSize = 8192;
+    def.nBufferSize = 100*1024;
     def.bEnabled = OMX_TRUE;
     def.bPopulated = OMX_FALSE;
     def.eDomain = OMX_PortDomainAudio;
@@ -90,7 +113,7 @@ void SoftAAC::initPorts() {
     def.eDir = OMX_DirOutput;
     def.nBufferCountMin = kNumOutputBuffers;
     def.nBufferCountActual = def.nBufferCountMin;
-    def.nBufferSize = 8192;
+    def.nBufferSize = 100*1024;
     def.bEnabled = OMX_TRUE;
     def.bPopulated = OMX_FALSE;
     def.eDomain = OMX_PortDomainAudio;
@@ -274,11 +297,45 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
         mConfig->inputBufferCurrentLength = header->nFilledLen;
         mConfig->inputBufferMaxLength = 0;
 
+#if WRITE_FILE
+        if(aacFp) {
+            fwrite(&mConfig->inputBufferCurrentLength, 1, 4, aacFp);
+            fwrite(mConfig->pInputBuffer,1, mConfig->inputBufferCurrentLength,aacFp);
+        }
+#endif
         Int err = PVMP4AudioDecoderConfig(mConfig, mDecoderBuf);
         if (err != MP4AUDEC_SUCCESS) {
+            ALOGE("PVMP4AudioDecoderConfig failed. err = %x", err);
+			mUseFaadDecoder = 1; // support FAAC Decoder, 0: no, 1: yes
+			if(mUseFaadDecoder == 1)
+	        {
+		        ALOGE("Try Faad Decoder.\n");
+				unsigned long cap = NeAACDecGetCapabilities();
+				hAac = NeAACDecOpen();
+				conf = NeAACDecGetCurrentConfiguration(hAac);
+				NeAACDecSetConfiguration(hAac, conf);// Initialise the library using one of the initialization functions
+			    unsigned long samplerate;
+			    unsigned char channels;
+				err = NeAACDecInit2(hAac, header->pBuffer + header->nOffset, header->nFilledLen, &samplerate, &channels);
+				if (err != 0)
+				{
+					ALOGE("NeAACDecInit2 failed: err = %d.\n", err);
+					NeAACDecClose(hAac);
+					hAac = NULL;
             mSignalledError = true;
             notify(OMX_EventError, OMX_ErrorUndefined, err, NULL);
             return;
+				}
+				mConfig->encodedChannels = channels;
+				mConfig->samplingRate = samplerate;
+				mConfig->frameLength = 2048;
+				mConfig->desiredChannels = channels;
+				ALOGI("samplerate = %d, channels = %d", samplerate, channels);
+			}else {
+	            mSignalledError = true;
+	            notify(OMX_EventError, OMX_ErrorUndefined, err, NULL);
+	            return;
+			}
         }
 
         inQueue.erase(inQueue.begin());
@@ -381,9 +438,21 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
         mConfig->pOutputBuffer_plus = &mConfig->pOutputBuffer[2048];
         mConfig->repositionFlag = false;
 
+#if WRITE_FILE
+        if(aacFp) {
+            fwrite(&mConfig->inputBufferCurrentLength, 1, 4, aacFp);
+            fwrite(mConfig->pInputBuffer,1, mConfig->inputBufferCurrentLength,aacFp);
+        }
+#endif
         Int32 prevSamplingRate = mConfig->samplingRate;
-        Int decoderErr = PVMP4AudioDecodeFrame(mConfig, mDecoderBuf);
-
+        Int decoderErr = MP4AUDEC_SUCCESS;
+		NeAACDecFrameInfo hInfo;
+		void *samplebuffer;
+		if(mUseFaadDecoder == 0) {
+			if(mConfig->isMutilChannle)
+				decoderErr = PVMP4AudioDecodeFrameSixChannel(mConfig, mDecoderBuf);
+			else
+				decoderErr = PVMP4AudioDecodeFrame(mConfig, mDecoderBuf);
         /*
          * AAC+/eAAC+ streams can be signalled in two ways: either explicitly
          * or implicitly, according to MPEG4 spec. AAC+/eAAC+ is a dual
@@ -445,9 +514,30 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
                 }
             }
         }
+		}else {
+			samplebuffer = NeAACDecDecode(hAac, &hInfo, inHeader->pBuffer + inHeader->nOffset, inHeader->nFilledLen);
+			if(hInfo.channels > 2) {
+				ALOGW("Now do not support channels > 2.\n");
+				hInfo.error = -1;
+			}
+			if ((hInfo.error == 0) && (hInfo.samples > 0))
+			{
+				decoderErr = MP4AUDEC_SUCCESS;
+				memcpy(outHeader->pBuffer + outHeader->nOffset, samplebuffer, hInfo.samples*2);
+			} else if (hInfo.error != 0) {
+				ALOGE("NeAACDecDecode error: error = %d.\n", hInfo.error);
+				decoderErr = MP4AUDEC_INVALID_FRAME;
+			} else {
+				decoderErr = MP4AUDEC_SUCCESS;
+			}
+			mConfig->inputBufferUsedLength = hInfo.bytesconsumed;
+		}
 
         size_t numOutBytes =
             mConfig->frameLength * sizeof(int16_t) * mConfig->desiredChannels;
+		if (mUseFaadDecoder == 1) {
+			numOutBytes = hInfo.samples*2;
+		}
 
         if (decoderErr == MP4AUDEC_SUCCESS) {
             CHECK_LE(mConfig->inputBufferUsedLength, inHeader->nFilledLen);
@@ -471,6 +561,7 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
             // we've previously decoded valid data, in the latter case
             // (decode failed) we'll output a silent frame.
 
+			if (mUseFaadDecoder == 0) {
             if (mUpsamplingFactor == 2) {
                 if (mConfig->desiredChannels == 1) {
                     memcpy(&mConfig->pOutputBuffer[1024],
@@ -479,6 +570,7 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
                 }
                 numOutBytes *= 2;
             }
+			}
 
             outHeader->nFilledLen = numOutBytes;
             outHeader->nFlags = 0;
@@ -487,7 +579,11 @@ void SoftAAC::onQueueFilled(OMX_U32 portIndex) {
                 mAnchorTimeUs
                     + (mNumSamplesOutput * 1000000ll) / mConfig->samplingRate;
 
+			if (mUseFaadDecoder == 0) {
             mNumSamplesOutput += mConfig->frameLength * mUpsamplingFactor;
+			} else {
+				mNumSamplesOutput += hInfo.samples>>1;
+			}
 
             outInfo->mOwnedByUs = false;
             outQueue.erase(outQueue.begin());

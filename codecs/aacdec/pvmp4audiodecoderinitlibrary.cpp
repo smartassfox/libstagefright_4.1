@@ -260,7 +260,11 @@ OSCL_EXPORT_REF Int PVMP4AudioDecoderInitLibrary(
      */
     pVars->perChan[0].fxpCoef = pVars->fxpCoef[0];
     pVars->perChan[1].fxpCoef = pVars->fxpCoef[1];
-
+#ifdef MIDDLE_CHANNLE
+	pVars->perChan[2].fxpCoef = pVars->fxpCoef[2];
+	pVars->perChan[3].fxpCoef = pVars->fxpCoef[3];
+	pVars->perChan[4].fxpCoef = pVars->fxpCoef[4];
+#endif
     /* Here, the "shared memory" pointer is set to point
      * at the 1024th element of fxpCoef, because those spaces
      * in memory are not used until the filterbank is called.
@@ -275,6 +279,14 @@ OSCL_EXPORT_REF Int PVMP4AudioDecoderInitLibrary(
     pVars->perChan[1].pShareWfxpCoef = (per_chan_share_w_fxpCoef *)
                                        & (pVars->perChan[1].fxpCoef[1024]);
 
+#ifdef MIDDLE_CHANNLE
+	pVars->perChan[2].pShareWfxpCoef = (per_chan_share_w_fxpCoef *)
+									  & (pVars->perChan[2].fxpCoef[1024]);
+	pVars->perChan[3].pShareWfxpCoef = (per_chan_share_w_fxpCoef *)
+									  & (pVars->perChan[3].fxpCoef[1024]);
+	pVars->perChan[4].pShareWfxpCoef = (per_chan_share_w_fxpCoef *)
+									  & (pVars->perChan[4].fxpCoef[1024]);
+#endif
     /*
      * This next line informs the function get_prog_config that no
      * configuration has been found thus far, so it is a default
@@ -318,6 +330,7 @@ OSCL_EXPORT_REF Int PVMP4AudioDecoderInitLibrary(
     pExt->encodedChannels = 0;
     pExt->samplingRate = 0;
     pExt->aacPlusUpsamplingFactor = 1;  /*  Default for regular AAC */
+	pExt->isMutilChannle = false;/*Default for mono /stero AAC*/
     pVars->aacPlusEnabled = pExt->aacPlusEnabled;
 
 

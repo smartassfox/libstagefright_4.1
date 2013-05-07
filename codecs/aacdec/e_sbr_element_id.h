@@ -65,7 +65,8 @@
 typedef enum
 {
     SBR_ID_SCE = 0,
-    SBR_ID_CPE
+    SBR_ID_CPE,
+    SBR_ID_LFE = 3
 }
 SBR_ELEMENT_ID;
 

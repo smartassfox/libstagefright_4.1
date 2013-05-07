@@ -5,6 +5,7 @@ LOCAL_SRC_FILES:=                 \
         TextDescriptions.cpp      \
         TimedTextDriver.cpp       \
         TimedText3GPPSource.cpp \
+        TimedTextMatroskaSource.cpp \
         TimedTextSource.cpp       \
         TimedTextSRTSource.cpp    \
         TimedTextPlayer.cpp

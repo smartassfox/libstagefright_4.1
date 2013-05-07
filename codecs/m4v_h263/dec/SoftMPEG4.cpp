@@ -420,13 +420,9 @@ void SoftMPEG4::onQueueFilled(OMX_U32 portIndex) {
             useExtTimestamp ? (inHeader->nTimeStamp + 500) / 1000 : 0xFFFFFFFF;
 
         int32_t bufferSize = inHeader->nFilledLen;
-        int32_t tmp = bufferSize;
 
-        // The PV decoder is lying to us, sometimes it'll claim to only have
-        // consumed a subset of the buffer when it clearly consumed all of it.
-        // ignore whatever it says...
         if (PVDecodeVideoFrame(
-                    mHandle, &bitstream, &timestamp, &tmp,
+                    mHandle, &bitstream, &timestamp, &bufferSize,
                     &useExtTimestamp,
                     outHeader->pBuffer) != PV_TRUE) {
             ALOGE("failed to decode video frame.");
@@ -443,8 +439,9 @@ void SoftMPEG4::onQueueFilled(OMX_U32 portIndex) {
         // decoder deals in ms, OMX in us.
         outHeader->nTimeStamp = timestamp * 1000;
 
-        inHeader->nOffset += bufferSize;
-        inHeader->nFilledLen = 0;
+        CHECK_LE(bufferSize, inHeader->nFilledLen);
+        inHeader->nOffset += inHeader->nFilledLen - bufferSize;
+        inHeader->nFilledLen = bufferSize;
 
         if (inHeader->nFilledLen == 0) {
             inInfo->mOwnedByUs = false;

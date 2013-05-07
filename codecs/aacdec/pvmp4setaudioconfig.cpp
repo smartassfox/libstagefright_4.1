@@ -261,7 +261,7 @@ Int PVMP4SetAudioConfig(
      *  Set number of channels
      */
 
-    if (num_ch == 2)
+    if (num_ch > 1)
     {
         pVars->prog_config.front.ele_is_cpe[0] = 1;
     }

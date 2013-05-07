@@ -32,6 +32,9 @@
 #include "include/MPEG2TSExtractor.h"
 #include "include/WVMExtractor.h"
 
+#include "include/rk29-ipp.h"
+#include <fcntl.h>
+#include <poll.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 #include <media/IMediaPlayerService.h>
@@ -52,7 +55,7 @@
 #include <gui/SurfaceTextureClient.h>
 
 #include <media/stagefright/foundation/AMessage.h>
-
+#include "FrameQueueManage.h"
 #include <cutils/properties.h>
 
 #define USE_SURFACE_ALLOC 1
@@ -62,8 +65,52 @@ namespace android {
 
 static int64_t kLowWaterMarkUs = 2000000ll;  // 2secs
 static int64_t kHighWaterMarkUs = 5000000ll;  // 5secs
+static int64_t kHighWaterMarkRTSPUs = 4000000ll;  // 4secs
 static const size_t kLowWaterMarkBytes = 40000;
 static const size_t kHighWaterMarkBytes = 200000;
+
+
+status_t getMimeFromUri(String8 *Uri, String8 *mime)
+{
+    const char *ptr = Uri->getPathExtension();
+    if (ptr && '\0' != ptr[0]) {
+        ptr++;
+        *mime = String8(ptr);
+    } else {
+        *mime = String8();
+        ALOGI("mime is NULL\n");
+    }
+    return OK;
+}
+status_t getMimeFromFd(int fd, String8 *mime,String8 *FilePath)
+{
+    static ssize_t link_dest_size;
+    static char link_dest[PATH_MAX];
+    const char *ptr = NULL;
+    String8 path;
+    path.appendFormat("/proc/%d/fd/%d", getpid(), fd);
+    if ((link_dest_size = readlink(path.string(), link_dest, sizeof(link_dest)-1)) < 0) {
+        *mime = NULL;
+        return errno;
+    } else {
+        link_dest[link_dest_size] = '\0';
+    }
+    path = link_dest;
+    ptr = path.string();
+    *FilePath = String8(ptr);
+    ptr = path.getPathExtension();
+    if (ptr && '\0' != ptr[0]) {
+        ptr++;
+        *mime = String8(ptr);
+    } else {
+        *mime = String8();
+        ALOGI("mime is NULL\n");
+    }
+    return OK;
+}
+static int passAwesomePlayFun(void* obj) {
+    return ((AwesomePlayer*)obj)->onDisplayEvent();
+}
 
 struct AwesomeEvent : public TimedEventQueue::Event {
     AwesomeEvent(
@@ -193,9 +240,13 @@ AwesomePlayer::AwesomePlayer()
       mVideoBuffer(NULL),
       mDecryptHandle(NULL),
       mLastVideoTimeUs(-1),
-      mTextDriver(NULL) {
+      mTextDriver(NULL),
+      preMediaTimeus(0),
+      mPreSeekTimeUs(0),
+      mPreSeekSysTimeUs(0) {
+	ALOGI("AwesomePlayer::AwesomePlayer()in");
     CHECK_EQ(mClient.connect(), (status_t)OK);
-
+	ALOGI("AwesomePlayer::AwesomePlayer()aftermClient.connect()");
     DataSource::RegisterDefaultSniffers();
 
     mVideoEvent = new AwesomeEvent(this, &AwesomePlayer::onVideoEvent);
@@ -211,17 +262,30 @@ AwesomePlayer::AwesomePlayer()
             this, &AwesomePlayer::onCheckAudioStatus);
 
     mAudioStatusEventPending = false;
-
+    pfrmanager = new FrameQueueManage;
+    FrmQueManStatus ret = FRM_QUE_MAN_OK;
+    FrmQueManContext context;
+    memset(&context, 0, sizeof(FrmQueManContext));
+    context.display_proc = passAwesomePlayFun;
+    context.obj = this;
+    if ((ret = pfrmanager->initFrmQueManContext(&context)) !=FRM_QUE_MAN_OK) {
+        goto FAIL;
+    }
+	pfrmanager->start();
     reset();
+    return;
+FAIL:
+    ALOGE("AwesomePlayer construct fail, ret: %d", ret);
 }
 
 AwesomePlayer::~AwesomePlayer() {
+	pfrmanager->stop();
     if (mQueueStarted) {
         mQueue.stop();
     }
 
     reset();
-
+    delete pfrmanager;
     mClient.disconnect();
 }
 
@@ -312,6 +376,7 @@ status_t AwesomePlayer::setDataSource(
     if (err != OK) {
         return err;
     }
+    err = getMimeFromFd(fd, &mMime,&filePath);
 
     mFileSource = dataSource;
 
@@ -330,7 +395,7 @@ status_t AwesomePlayer::setDataSource(const sp<IStreamSource> &source) {
 
 status_t AwesomePlayer::setDataSource_l(
         const sp<DataSource> &dataSource) {
-    sp<MediaExtractor> extractor = MediaExtractor::Create(dataSource);
+    sp<MediaExtractor> extractor = MediaExtractor::Create(dataSource, mMime.string(), true,filePath.string());
 
     if (extractor == NULL) {
         return UNKNOWN_ERROR;
@@ -423,6 +488,15 @@ status_t AwesomePlayer::setDataSource_l(const sp<MediaExtractor> &extractor) {
                 stat->mMIME = mime.string();
             }
         } else if (!haveAudio && !strncasecmp(mime.string(), "audio/", 6)) {
+            /*
+             ** if current mode is in Live WallPaper, do not open audio codec.
+            */
+            if (pfrmanager) {
+                if (pfrmanager->mPlayerExtCfg.flag & LIVE_WALL_PAPER_ENABLE) {
+                    continue;
+                }
+            }
+
             setAudioSource(extractor->getTrack(i));
             haveAudio = true;
             mActiveAudioTrackIndex = i;
@@ -448,7 +522,11 @@ status_t AwesomePlayer::setDataSource_l(const sp<MediaExtractor> &extractor) {
                     modifyFlags(AUTO_LOOPING, SET);
                 }
             }
-        } else if (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_3GPP)) {
+        } else if ((!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_3GPP)) ||
+                (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_UTF8)) ||
+                (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_SSA)) ||
+                (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_VOBSUB))) {
+
             addTextSource_l(i, extractor->getTrack(i));
         }
     }
@@ -511,6 +589,8 @@ void AwesomePlayer::reset_l() {
     cancelPlayerEvents();
 
     mWVMExtractor.clear();
+	pfrmanager->pause();
+	pfrmanager->flushframes(true);
     mCachedSource.clear();
     mAudioTrack.clear();
     mVideoTrack.clear();
@@ -541,6 +621,10 @@ void AwesomePlayer::reset_l() {
     }
 
     mVideoRenderer.clear();
+	if (mVideoBuffer) {
+        mVideoBuffer->releaseframe();
+        mVideoBuffer = NULL;
+    }
 
     if (mVideoSource != NULL) {
         shutdownVideoDecoder_l();
@@ -551,6 +635,7 @@ void AwesomePlayer::reset_l() {
     mExtractorFlags = 0;
     mTimeSourceDeltaUs = 0;
     mVideoTimeUs = 0;
+	started_realtime = 0;
 
     mSeeking = NO_SEEK;
     mSeekNotificationSent = true;
@@ -704,6 +789,11 @@ void AwesomePlayer::onBufferingUpdate() {
                     ensureCacheIsFetching_l();
                     sendCacheStats();
                     notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_START);
+
+                    if (pfrmanager) {
+                        pfrmanager->mPlayerExtCfg.isBuffering = true;
+                    }
+
                 } else if (eos || cachedDataRemaining > kHighWaterMarkBytes) {
                     if (mFlags & CACHE_UNDERRUN) {
                         ALOGI("cache has filled up (> %d), resuming.",
@@ -711,6 +801,11 @@ void AwesomePlayer::onBufferingUpdate() {
                         modifyFlags(CACHE_UNDERRUN, CLEAR);
                         play_l();
                         notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_END);
+
+                        if (pfrmanager) {
+                            pfrmanager->mPlayerExtCfg.isBuffering = false;
+                        }
+
                     } else if (mFlags & PREPARING) {
                         ALOGV("cache has filled up (> %d), prepare is done",
                              kHighWaterMarkBytes);
@@ -962,6 +1057,7 @@ status_t AwesomePlayer::play_l() {
     }
     addBatteryData(params);
 
+    pfrmanager->play();
     return OK;
 }
 
@@ -1004,6 +1100,7 @@ status_t AwesomePlayer::startAudioPlayer_l(bool sendErrorNotification) {
 
     mWatchForAudioEOS = true;
 
+	pfrmanager->play();
     return OK;
 }
 
@@ -1085,7 +1182,11 @@ void AwesomePlayer::initRenderer_l() {
     CHECK(meta->findCString(kKeyDecoderComponent, &component));
     CHECK(meta->findInt32(kKeyWidth, &decodedWidth));
     CHECK(meta->findInt32(kKeyHeight, &decodedHeight));
-
+    if(isStreamingHTTP())
+    {
+        int32_t httpFlag = 1;
+        meta->setInt32(kKeyIsHttp, httpFlag);
+    }
     int32_t rotationDegrees;
     if (!mVideoTrack->getFormat()->findInt32(
                 kKeyRotation, &rotationDegrees)) {
@@ -1103,6 +1204,7 @@ void AwesomePlayer::initRenderer_l() {
     if (USE_SURFACE_ALLOC
             && !strncmp(component, "OMX.", 4)
             && strncmp(component, "OMX.google.", 11)
+			&& strncmp(component, "OMX.rk", 6)
             && strcmp(component, "OMX.Nvidia.mpeg2v.decode")) {
         // Hardware decoders avoid the CPU color conversion by decoding
         // directly to ANativeBuffers, so we must use a renderer that
@@ -1114,6 +1216,7 @@ void AwesomePlayer::initRenderer_l() {
         // allocate their buffers in local address space.  This renderer
         // then performs a color conversion and copy to get the data
         // into the ANativeBuffer.
+        meta->setInt32(kKeyRotation,rotationDegrees);
         mVideoRenderer = new AwesomeLocalRenderer(mNativeWindow, meta);
     }
 }
@@ -1154,6 +1257,7 @@ status_t AwesomePlayer::pause_l(bool at_eos) {
     }
 
     modifyFlags(PLAYING, CLEAR);
+    pfrmanager->pause();
 
     if (mDecryptHandle != NULL) {
         mDrmManagerClient->setPlaybackStatus(mDecryptHandle,
@@ -1185,6 +1289,12 @@ status_t AwesomePlayer::setSurfaceTexture(const sp<ISurfaceTexture> &surfaceText
         err = setNativeWindow_l(new SurfaceTextureClient(surfaceTexture));
     } else {
         err = setNativeWindow_l(NULL);
+    }
+
+    if (pfrmanager) {
+        pfrmanager->mPlayerExtCfg.isBuffering = true;
+
+        notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_START);
     }
 
     return err;
@@ -1223,21 +1333,25 @@ status_t AwesomePlayer::setNativeWindow_l(const sp<ANativeWindow> &native) {
 
     pause_l();
     mVideoRenderer.clear();
-
-    shutdownVideoDecoder_l();
-
-    status_t err = initVideoDecoder();
-
+	//current awesomeplayer use software render ,it can repalce surfaceview during player playing.
+	//fixed by CharlesChen May, 25th,2012
+   /* shutdownVideoDecoder_l();
+#ifdef HWDEC
+    status_t err = initVideoDecoder(OMXCodec::kHardwareCodecsOnly);
+#else
+    status_t err = initVideoDecoder(OMXCodec::kSoftwareCodecsOnly);
+#endif
     if (err != OK) {
-        ALOGE("failed to reinstantiate video decoder after surface change.");
+        LOGE("failed to reinstantiate video decoder after surface change.");
         return err;
-    }
+    }*/
+	 initRenderer_l();
 
-    if (mLastVideoTimeUs >= 0) {
+   /* if (mLastVideoTimeUs >= 0) {
         mSeeking = SEEK;
         mSeekTimeUs = mLastVideoTimeUs;
         modifyFlags((AT_EOS | AUDIO_AT_EOS | VIDEO_AT_EOS), CLEAR);
-    }
+    }*/
 
     if (wasPlaying) {
         play_l();
@@ -1297,8 +1411,16 @@ status_t AwesomePlayer::seekTo(int64_t timeUs) {
     ATRACE_CALL();
 
     if (mExtractorFlags & MediaExtractor::CAN_SEEK) {
+		status_t	result;
+		pfrmanager->pause();
+		if (mCachedSource != NULL)
+			mCachedSource->set_palystate(true);
+		{
         Mutex::Autolock autoLock(mLock);
-        return seekTo_l(timeUs);
+			result = seekTo_l(timeUs);
+		}
+		pfrmanager->play();
+		return result;
     }
 
     return OK;
@@ -1318,6 +1440,22 @@ status_t AwesomePlayer::seekTo_l(int64_t timeUs) {
         postVideoEvent_l();
     }
 
+    int64_t curSeekSysTimeUs = mQueue.getRealTimeUs();
+
+    /* only do skip seek when play video */
+    if ((mVideoTrack !=NULL) && (mPreSeekTimeUs >0) &&
+            (abs(mPreSeekTimeUs - timeUs) <500000) &&
+            (abs(mPreSeekSysTimeUs - curSeekSysTimeUs) <5000000ll)) {
+
+        /* no need to seek, skip seek this time */
+        notifyListener_l(MEDIA_SEEK_COMPLETE);
+        mSeekNotificationSent = true;
+        return OK;
+    } else {
+        mPreSeekTimeUs = timeUs;
+    }
+
+    mPreSeekSysTimeUs = curSeekSysTimeUs;
     mSeeking = SEEK;
     mSeekNotificationSent = false;
     mSeekTimeUs = timeUs;
@@ -1586,12 +1724,19 @@ void AwesomePlayer::onVideoEvent() {
     }
     mVideoEventPending = false;
 
+    if (!(mFlags & PLAYING)){
+        postVideoEvent_l(1000);
+        return;
+    }
     if (mSeeking != NO_SEEK) {
         if (mVideoBuffer) {
-            mVideoBuffer->release();
+            mVideoBuffer->releaseframe();
             mVideoBuffer = NULL;
         }
-
+       mVideoTimeUs = mSeekTimeUs;
+	   mFlags |= FIRST_FRAME;
+	   pfrmanager->flushframes(false);
+       pfrmanager->flushVobSubQueue();
         if (mSeeking == SEEK && isStreamingHTTP() && mAudioSource != NULL
                 && !(mFlags & SEEK_PREVIEW)) {
             // We're going to seek the video source first, followed by
@@ -1609,6 +1754,7 @@ void AwesomePlayer::onVideoEvent() {
             }
             mAudioSource->pause();
         }
+	    pfrmanager->play();
     }
 
     if (!mVideoBuffer) {
@@ -1621,10 +1767,31 @@ void AwesomePlayer::onVideoEvent() {
                     mSeeking == SEEK_VIDEO_ONLY
                         ? MediaSource::ReadOptions::SEEK_NEXT_SYNC
                         : MediaSource::ReadOptions::SEEK_CLOSEST_SYNC);
+            if (pfrmanager->mHaveReadOneFrm ==false) {
+                status_t err = mVideoSource->read(&mVideoBuffer, NULL);
+
+                 if(mVideoBuffer) {
+				 	mVideoBuffer->release();
+                 	mVideoBuffer = NULL;
+				 }
+
+                 pfrmanager->mHaveReadOneFrm = true;
+
+            }
         }
         for (;;) {
             status_t err = mVideoSource->read(&mVideoBuffer, &options);
             options.clearSeekTo();
+			if(err == INFO_TIME_OUT)
+			{
+                 if(mVideoBuffer)
+				 {
+				 	mVideoBuffer->release();
+                 	mVideoBuffer = NULL;
+				 }
+                 postVideoEvent_l(1000);
+				 return;
+			}
 
             if (err != OK) {
                 CHECK(mVideoBuffer == NULL);
@@ -1633,6 +1800,11 @@ void AwesomePlayer::onVideoEvent() {
                     ALOGV("VideoSource signalled format change.");
 
                     notifyVideoSize_l();
+                    int32_t decodedWidth, decodedHeight;
+                    CHECK(mVideoSource->getFormat()->findInt32(kKeyWidth, &decodedWidth));
+                    CHECK(mVideoSource->getFormat()->findInt32(kKeyHeight, &decodedHeight));
+                    mVideoTrack->getFormat()->setInt32(kKeyWidth, decodedWidth);
+                    mVideoTrack->getFormat()->setInt32(kKeyHeight, decodedHeight);
 
                     if (mVideoRenderer != NULL) {
                         mVideoRendererIsPreview = false;
@@ -1667,20 +1839,61 @@ void AwesomePlayer::onVideoEvent() {
                 mVideoBuffer = NULL;
                 continue;
             }
+            pfrmanager->mHaveReadOneFrm = true;
+			int32_t revertFlag = 0;
 
+            VPU_FRAME *frame = (VPU_FRAME *)mVideoBuffer->data();
+            if((frame->FrameType || pfrmanager->mCurrentSubIsVobSub)
+                && !pfrmanager->deintFlag)
+            {
+                pfrmanager->deintFlag = 1;
+#if USE_DEINTERLACE_DEV
+                pfrmanager->deint = new deinterlace_dev();
+                if (NULL == pfrmanager->deint) {
+                    pfrmanager->deintFlag = 0;
+                } else {
+                    if (0 == pfrmanager->deint->test()) {
+                        ;//ALOGI("test ipp ok");
+                    } else {
+                        pfrmanager->deintFlag = 0;
+                    }
+                }
+#else
+                pfrmanager->ipp_fd = open("/dev/rk29-ipp",O_RDWR,0);
+                if(pfrmanager->ipp_fd < 0)
+                {
+                    ALOGI("open /dev/rk29-ipp fail!");
+                    pfrmanager->deintFlag = 0;
+                }
+                else
+                {
+                    pfrmanager->fd.fd = pfrmanager->ipp_fd;
+                    pfrmanager->fd.events = POLLIN;
+                    struct rk29_ipp_req ipp_req;
+                    memset(&ipp_req,0,sizeof(rk29_ipp_req));
+                    ipp_req.deinterlace_enable =2;
+                    ALOGI("test ipp is support or not");
+                    int ret = ioctl(pfrmanager->ipp_fd, IPP_BLIT_ASYNC, &ipp_req);
+                    if(ret)
+                    {
+                        pfrmanager->deintFlag = 0;
+                        close(pfrmanager->ipp_fd);
+                    }
+                    ALOGI("test ipp ok");
+                }
+#endif
+            }
             break;
         }
-
-        {
-            Mutex::Autolock autoLock(mStatsLock);
-            ++mStats.mNumVideoFramesDecoded;
+        if (mSeeking == SEEK) {
+            if (mCachedSource != NULL)
+                mCachedSource->set_palystate(false);
         }
     }
 
     int64_t timeUs;
     CHECK(mVideoBuffer->meta_data()->findInt64(kKeyTime, &timeUs));
 
-    mLastVideoTimeUs = timeUs;
 
     if (mSeeking == SEEK_VIDEO_ONLY) {
         if (mSeekTimeUs > timeUs) {
@@ -1689,10 +1902,6 @@ void AwesomePlayer::onVideoEvent() {
         }
     }
 
-    {
-        Mutex::Autolock autoLock(mMiscStateLock);
-        mVideoTimeUs = timeUs;
-    }
 
     SeekType wasSeeking = mSeeking;
     finishSeekIfNecessary(timeUs);
@@ -1714,11 +1923,11 @@ void AwesomePlayer::onVideoEvent() {
         ((mFlags & AUDIO_AT_EOS) || !(mFlags & AUDIOPLAYER_STARTED))
             ? &mSystemTimeSource : mTimeSource;
 
-    if (mFlags & FIRST_FRAME) {
+/*    if (mFlags & FIRST_FRAME) {
         modifyFlags(FIRST_FRAME, CLEAR);
         mSinceLastDropped = 0;
         mTimeSourceDeltaUs = ts->getRealTimeUs() - timeUs;
-    }
+    }*/
 
     int64_t realTimeUs, mediaTimeUs;
     if (!(mFlags & AUDIO_AT_EOS) && mAudioPlayer != NULL
@@ -1738,9 +1947,57 @@ void AwesomePlayer::onVideoEvent() {
         }
     }
 
-    if (wasSeeking == NO_SEEK) {
-        // Let's display the first frame after seeking right away.
+    if (mSeeking == NO_SEEK) {
+        if ((mNativeWindow != NULL)
+        && (mVideoRendererIsPreview || mVideoRenderer == NULL)) {
+            mVideoRendererIsPreview = false;
 
+            initRenderer_l();
+        }
+		if (pfrmanager->cache_full())
+		{
+			postVideoEvent_l(10000);
+		}
+		else
+		{
+#ifdef HWDEC
+			if ((mVideoBuffer)&&(mVideoBuffer->data()))
+    		{
+                    int64_t timeUs;
+                    MediaBuffer *mVideoTempBuffer = new MediaBuffer(sizeof(VPU_FRAME));
+                    mVideoBuffer->meta_data()->findInt64(kKeyTime, &timeUs);
+                    mVideoTempBuffer->meta_data()->setInt64(kKeyTime,timeUs);
+                    memcpy(mVideoTempBuffer->data(),mVideoBuffer->data(),sizeof(VPU_FRAME));
+                    if( pfrmanager->deintFlag)
+    				{
+    				     pfrmanager->pushDeInterlaceframe(mVideoTempBuffer);
+    				}
+    				else
+    				{
+    					pfrmanager->pushframe(new FrameQueue(mVideoTempBuffer));
+    				}
+                    mVideoBuffer->release();
+			}
+#else
+			if ((mVideoBuffer)&&(mVideoBuffer->data()))
+			{
+				if( pfrmanager->deintFlag)
+				{
+				     pfrmanager->pushDeInterlaceframe(mVideoBuffer);
+				}
+				else
+				{
+					pfrmanager->pushframe(new FrameQueue(mVideoBuffer));
+				}
+
+            }
+#endif
+            mVideoBuffer = NULL;
+            postVideoEvent_l(200);
+        }
+	}
+        // Let's display the first frame after seeking right away.
+#if 0
         int64_t nowUs = ts->getRealTimeUs() - mTimeSourceDeltaUs;
 
         int64_t latenessUs = nowUs - timeUs;
@@ -1818,6 +2075,7 @@ void AwesomePlayer::onVideoEvent() {
     }
 
     postVideoEvent_l();
+#endif
 }
 
 void AwesomePlayer::postVideoEvent_l(int64_t delayUs) {
@@ -1976,6 +2234,8 @@ status_t AwesomePlayer::finishSetDataSource_l() {
         newURI.append(mUri.string() + 11);
 
         mUri = newURI;
+    }else if(strstr(mUri.string(),"wvm")&&!strncasecmp("http://", mUri.string(), 7)){
+        isWidevineStreaming = true;
     }
 
     AString sniffedMIME;
@@ -2140,8 +2400,9 @@ status_t AwesomePlayer::finishSetDataSource_l() {
             mWVMExtractor->setUID(mUID);
         extractor = mWVMExtractor;
     } else {
+        getMimeFromUri(&mUri, &mMime);
         extractor = MediaExtractor::Create(
-                dataSource, sniffedMIME.empty() ? NULL : sniffedMIME.c_str());
+                dataSource, mMime.string(), true, mUri.string());
 
         if (extractor == NULL) {
             return UNKNOWN_ERROR;
@@ -2202,7 +2463,7 @@ void AwesomePlayer::onPrepareAsyncEvent() {
     }
 
     if (mVideoTrack != NULL && mVideoSource == NULL) {
-        status_t err = initVideoDecoder();
+        status_t err = initVideoDecoder(OMXCodec::kSoftwareCodecsOnly);
 
         if (err != OK) {
             abortPrepare(err);
@@ -2228,6 +2489,86 @@ void AwesomePlayer::onPrepareAsyncEvent() {
     }
 }
 
+int64_t AwesomePlayer::onDisplayEvent()
+{
+	FrameQueue	*frame;
+	int64_t curtime;
+	curtime = mQueue.getRealTimeUs();
+
+	pfrmanager->deleteframe(curtime);
+    frame = pfrmanager->getNextDiplayframe();
+	if (frame)
+	{
+		int64_t timeUs;
+
+		CHECK(frame->info->meta_data()->findInt64(kKeyTime, &timeUs));
+
+		if (mFlags & FIRST_FRAME)
+		{
+			mFlags &= ~FIRST_FRAME;
+			started_realtime = curtime - timeUs;
+		}
+
+        {
+            Mutex::Autolock autoLock(mMiscStateLock);
+			mVideoTimeUs = timeUs;
+            mLastVideoTimeUs = timeUs;
+        }
+		int64_t nowUs = curtime-started_realtime;
+		int64_t mediaTimeUs = nowUs;
+
+		if (!(mFlags & AUDIO_AT_EOS) && mAudioPlayer != NULL)
+		{
+            int64_t realTimeUs, pmediaTimeUs;
+
+            if (mAudioPlayer->getMediaTimeMapping(&realTimeUs, &pmediaTimeUs)) {
+                mediaTimeUs = mAudioPlayer->getRealTimeUs();
+                mediaTimeUs = mediaTimeUs - realTimeUs + pmediaTimeUs;
+            } else {
+                mediaTimeUs = 0;
+            }
+
+            if(mediaTimeUs <= 0)
+				mediaTimeUs = nowUs;
+	    }
+
+		if ((preMediaTimeus != mediaTimeUs)&&(abs(nowUs-mediaTimeUs)>100000ll))
+		{
+			nowUs = mediaTimeUs;
+			started_realtime = curtime-mediaTimeUs;
+		}
+        preMediaTimeus = mediaTimeUs;
+	    int64_t latenessUs = nowUs - timeUs;
+	    if (latenessUs < -8000) {
+			if (latenessUs<-50000)
+				return 25000;
+	        return - latenessUs-1000;
+	    }
+		//if(latenessUs>11000ll)
+		//LOGD("we're late by %08lld us (%.2f secs)", latenessUs, latenessUs / 1E6);
+
+
+	   if (mVideoRenderer != NULL )
+        {
+            mVideoRenderer->render(frame->info);
+
+            if (pfrmanager && (pfrmanager->mPlayerExtCfg.isBuffering == true)) {
+                notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_END);
+                pfrmanager->mPlayerExtCfg.isBuffering = false;
+            }
+        }
+
+       
+		if (pfrmanager->plastdisplay)
+			pfrmanager->plastdisplay->time = curtime;
+		pfrmanager->plastdisplay = frame;
+		pfrmanager->updateDisplayframe();
+	} else {
+		;//LOGD("No more display frame!\n");
+	}
+
+	return 8000ll;
+}
 void AwesomePlayer::finishAsyncPrepare_l() {
     if (mIsAsyncPrepare) {
         if (mVideoSource == NULL) {
@@ -2272,6 +2613,16 @@ status_t AwesomePlayer::setParameter(int key, const Parcel &request) {
                 return NO_INIT;
             }
         }
+        case KEY_PARAMETER_SET_LIVE_WALL_PAPER:
+        {
+            int32_t enable = request.readInt32();
+
+            if (pfrmanager && enable) {
+                pfrmanager->mPlayerExtCfg.flag |=LIVE_WALL_PAPER_ENABLE;
+            }
+
+            return OK;
+        }
         default:
         {
             return ERROR_UNSUPPORTED;
@@ -2290,6 +2641,8 @@ status_t AwesomePlayer::setCacheStatCollectFreq(const Parcel &request) {
 }
 
 status_t AwesomePlayer::getParameter(int key, Parcel *reply) {
+    int32_t subFrmDurationMs = 0;
+
     switch (key) {
     case KEY_PARAMETER_AUDIO_CHANNEL_COUNT:
         {
@@ -2301,8 +2654,21 @@ status_t AwesomePlayer::getParameter(int key, Parcel *reply) {
             reply->writeInt32(channelCount);
         }
         return OK;
+
+    case KEY_PARAMETER_TIMED_TEXT_FRAME_DURATION_MS:
+        {
+            if (mTextDriver) {
+                subFrmDurationMs = mTextDriver->getCurFrameDuration();
+            }
+
+            reply->writeInt32(subFrmDurationMs);
+        }
+
+        return OK;
+
     default:
         {
+            ALOGI("getParameter, key: %d not supported", key);
             return ERROR_UNSUPPORTED;
         }
     }
@@ -2330,7 +2696,10 @@ status_t AwesomePlayer::getTrackInfo(Parcel *reply) const {
             reply->writeInt32(MEDIA_TRACK_TYPE_VIDEO);
         } else if (!strncasecmp(mime.string(), "audio/", 6)) {
             reply->writeInt32(MEDIA_TRACK_TYPE_AUDIO);
-        } else if (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_3GPP)) {
+        } else if ((!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_3GPP)) ||
+                    (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_UTF8)) ||
+                    (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_SSA)) ||
+                    (!strcasecmp(mime.string(), MEDIA_MIMETYPE_TEXT_MATROSKA_VOBSUB))) {
             reply->writeInt32(MEDIA_TRACK_TYPE_TIMEDTEXT);
         } else {
             reply->writeInt32(MEDIA_TRACK_TYPE_UNKNOWN);
@@ -2380,6 +2749,11 @@ status_t AwesomePlayer::selectAudioTrack_l(
 
     int64_t curTimeUs;
     CHECK_EQ(getPosition(&curTimeUs), (status_t)OK);
+
+    /*
+     ** set mPreSeekTimeUs to -1, not skip seek in audio select track mode.
+    */
+    mPreSeekTimeUs = -1;
 
     if ((mAudioPlayer == NULL || !(mFlags & AUDIOPLAYER_STARTED))
             && mAudioSource != NULL) {
@@ -2440,7 +2814,12 @@ status_t AwesomePlayer::selectTrack(size_t trackIndex, bool select) {
         CHECK(meta->findCString(kKeyMIMEType, &mime));
         isAudioTrack = !strncasecmp(mime, "audio/", 6);
 
-        if (!isAudioTrack && strcasecmp(mime, MEDIA_MIMETYPE_TEXT_3GPP) != 0) {
+        if (!isAudioTrack &&
+            (strcasecmp(mime, MEDIA_MIMETYPE_TEXT_3GPP) != 0) &&
+            (strcasecmp(mime, MEDIA_MIMETYPE_TEXT_MATROSKA_UTF8) != 0) &&
+            (strcasecmp(mime, MEDIA_MIMETYPE_TEXT_MATROSKA_SSA) != 0) &&
+            (strcasecmp(mime, MEDIA_MIMETYPE_TEXT_MATROSKA_VOBSUB) != 0)) {
+
             ALOGE("Track %d is not either audio or timed text", trackIndex);
             return ERROR_UNSUPPORTED;
         }

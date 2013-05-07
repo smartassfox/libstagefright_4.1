@@ -295,10 +295,10 @@ MP3Extractor::MP3Extractor(
 
     switch (layer) {
         case 1:
-            mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_I);
+            //mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_I);
             break;
         case 2:
-            mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_II);
+            //mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_II);
             break;
         case 3:
             mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG);
@@ -653,7 +653,7 @@ bool SniffMP3(
     (*meta)->setInt64("post-id3-offset", post_id3_pos);
 
     *mimeType = MEDIA_MIMETYPE_AUDIO_MPEG;
-    *confidence = 0.2f;
+    *confidence = MP3_CONTAINER_CONFIDENCE;
 
     return true;
 }

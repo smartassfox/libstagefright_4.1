@@ -217,7 +217,11 @@ OSCL_EXPORT_REF Int PVMP4AudioDecoderConfig(
         pVars->aacConfigUtilityEnabled = false;  /* set aac dec mode */
 
         status = get_audio_specific_config(pVars);
-
+		if(status == 6)
+		{
+			pExt->isMutilChannle = true;
+			status = SUCCESS;
+		}
     }
 
     byte_align(&pVars->inputStream);

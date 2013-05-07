@@ -80,14 +80,14 @@ extern "C"
          * (modify for any desired decoder configuration)
          */
         FChans  = 2,    /* front channels: left, center, right */
-        FCenter = 0,    /* 1 if decoder has front center channel */
+        FCenter = 1,    /* 1 if decoder has front center channel */
         SChans  = 0,    /* side channels: */
-        BChans  = 0,    /* back channels: left surround, right surround */
+        BChans  = 2,    /* back channels: left surround, right surround */
         BCenter = 0,    /* 1 if decoder has back center channel */
         LChans  = 0,    /* LFE channels */
         XChans  = 0,    /* scratch space for parsing unused channels */
 
-        Chans   = FChans + SChans + BChans + LChans + XChans
+        Chans   = FChans + FCenter + SChans + BChans + LChans + XChans 
     };
     /*----------------------------------------------------------------------------
     ; STRUCTURES TYPEDEF'S

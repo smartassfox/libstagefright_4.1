@@ -554,7 +554,7 @@ int64_t AudioPlayer::getMediaTimeUs() {
         realTimeOffset = 0;
     }
 
-    return mPositionTimeMediaUs + realTimeOffset;
+    return realTimeOffset + mPositionTimeMediaUs;
 }
 
 bool AudioPlayer::getMediaTimeMapping(

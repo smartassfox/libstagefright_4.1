@@ -19,6 +19,7 @@
 #define SOFT_AAC_H_
 
 #include "SimpleSoftOMXComponent.h"
+#include "neaacdec.h"
 
 struct tPVMP4AudioDecoderExternal;
 
@@ -57,6 +58,9 @@ private:
     size_t mUpsamplingFactor;
     int64_t mAnchorTimeUs;
     int64_t mNumSamplesOutput;
+	int mUseFaadDecoder;
+	NeAACDecHandle hAac;
+	NeAACDecConfigurationPtr conf;	
 
     bool mSignalledError;
 

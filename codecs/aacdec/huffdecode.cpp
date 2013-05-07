@@ -414,6 +414,7 @@ Int huffdecode(
      *  matches read bitstream data, if not, allow update only once.
      *  In almost all cases it should match.
      */
+#if 0     
     if ((pMcInfo->ch_info[0].cpe != id_syn_ele))
     {
         if (pVars->mc_info.implicit_channeling)     /* check done only once */
@@ -430,6 +431,7 @@ Int huffdecode(
             status = 1; /* ERROR break if syntax error persist  */
         }
     }
+#endif
 
     if (status == SUCCESS)
     {
@@ -493,6 +495,11 @@ Int huffdecode(
             } /* if (common_window) */
 
         } /* if (id_syn_ele) */
+        else if (id_syn_ele == ID_LFE)
+        {
+            num_channels = 1;
+            pVars->hasmask = 0;
+        } /* if (id_syn_ele) == ID_LFE */
 
     } /* if (status) */
 

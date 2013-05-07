@@ -70,6 +70,7 @@
 
 #include "e_tmp4audioobjecttype.h"
 
+#define MIDDLE_CHANNLE
 /*----------------------------------------------------------------------------
 ; INCLUDES
 ----------------------------------------------------------------------------*/
@@ -324,6 +325,7 @@ extern "C"
         * in file e_tMP4AudioObjectType.h. It carries the output Audio Object Type
         */
         Int     extendedAudioObjectType;
+		bool   isMutilChannle;
 
 
     } tPVMP4AudioDecoderExternal;
@@ -340,6 +342,9 @@ extern "C"
         void                        *pMem);
 
     OSCL_IMPORT_REF Int PVMP4AudioDecodeFrame(
+        tPVMP4AudioDecoderExternal  *pExt,
+        void                        *pMem);
+    OSCL_IMPORT_REF Int PVMP4AudioDecodeFrameSixChannel(
         tPVMP4AudioDecoderExternal  *pExt,
         void                        *pMem);
 

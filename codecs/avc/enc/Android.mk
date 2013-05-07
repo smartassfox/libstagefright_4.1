@@ -2,6 +2,7 @@ LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := \
+    AVCEncoder.cpp \
     src/avcenc_api.cpp \
     src/bitstream_io.cpp \
     src/block.cpp \
@@ -25,7 +26,12 @@ LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/src \
     $(LOCAL_PATH)/../common/include \
     $(TOP)/frameworks/av/media/libstagefright/include \
-    $(TOP)/frameworks/native/include/media/openmax
+    $(TOP)/frameworks/native/include/media/openmax \
+    $(TOP)/frameworks/av/media/libstagefright/libvpu/avc_h264/enc/include \
+    $(TOP)/frameworks/av/media/libstagefright/libvpu/vp8/enc/include \
+    $(TOP)/frameworks/av/media/libstagefright/libvpu/avc_h264/enc/src \
+    $(TOP)/frameworks/av/media/libstagefright/libvpu/common/include \
+    $(TOP)/frameworks/av/media/libstagefright/libvpu/common
 
 LOCAL_CFLAGS := \
     -D__arm__ \

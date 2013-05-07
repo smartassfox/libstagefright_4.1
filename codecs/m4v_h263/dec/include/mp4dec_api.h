@@ -20,7 +20,7 @@
 
 #include "m4vh263_decoder_pv_types.h"
 
-// #define PV_TOLERATE_VOL_ERRORS
+#define PV_TOLERATE_VOL_ERRORS
 #define PV_MEMORY_POOL
 
 #ifndef _PV_TYPES_
@@ -95,7 +95,7 @@ typedef struct tagvideoDecControls
 
 typedef enum
 {
-    H263_MODE = 0, MPEG4_MODE, UNKNOWN_MODE
+    H263_MODE = 0, MPEG4_MODE = 1, MJPEG_MODE = 2, UNKNOWN_MODE
 } MP4DecodingMode;
 
 typedef enum

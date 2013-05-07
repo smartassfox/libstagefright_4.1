@@ -36,7 +36,8 @@ static const int64_t kWaitTimeUsToRetryRead = 100000ll;
 TimedTextPlayer::TimedTextPlayer(const wp<MediaPlayerBase> &listener)
     : mListener(listener),
       mSource(NULL),
-      mSendSubtitleGeneration(0) {
+      mSendSubtitleGeneration(0),
+      mCurSubFrmDurMs(0) {
 }
 
 TimedTextPlayer::~TimedTextPlayer() {
@@ -173,6 +174,13 @@ void TimedTextPlayer::doRead(MediaSource::ReadOptions* options) {
     } else if (err != OK) {
         notifyError(err);
         return;
+    }
+
+    if (endTimeUs >startTimeUs) {
+        mCurSubFrmDurMs = (endTimeUs - startTimeUs) / 1000;
+        mCurSubFrmDurMs = mCurSubFrmDurMs >0 ? mCurSubFrmDurMs : 0;
+    } else {
+        mCurSubFrmDurMs = 0;
     }
 
     postTextEvent(parcelEvent, startTimeUs);

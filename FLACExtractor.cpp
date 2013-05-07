@@ -350,7 +350,7 @@ void FLACParser::metadataCallback(const FLAC__StreamMetadata *metadata)
         for (FLAC__uint32 i = 0; i < vc->num_comments; ++i) {
             FLAC__StreamMetadata_VorbisComment_Entry *vce;
             vce = &vc->comments[i];
-            if (mFileMetadata != 0) {
+            if ((mFileMetadata != 0) && vce->entry) {
                 parseVorbisComment(mFileMetadata, (const char *) vce->entry,
                         vce->length);
             }
@@ -801,6 +801,13 @@ bool SniffFLAC(
     if (source->readAt(0, header, sizeof(header)) != sizeof(header)
             || memcmp("fLaC\0\0\0\042", header, 4+4))
     {
+       if(!memcmp("fLaC",header,4))
+       	{
+		   *mimeType = MEDIA_MIMETYPE_AUDIO_FLAC;
+		   *confidence = 0.5;
+		     return true;
+
+	 }
         return false;
     }
 

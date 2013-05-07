@@ -456,8 +456,10 @@
 #include "get_sbr_bitstream.h"
 #include "e_sbr_element_id.h"
 
-
-
+#include "utils/Log.h"
+#undef ALOGI
+#define ALOGI(...)
+#define ALOGD ALOGI
 /*----------------------------------------------------------------------------
 ; MACROS
 ; Define module specific macros here
@@ -471,7 +473,9 @@
 
 #define LEFT (0)
 #define RIGHT (1)
-
+#define MIDDLE (2)
+#define BLEFT (3)
+#define BRIGHT (4)
 
 /*----------------------------------------------------------------------------
 ; LOCAL FUNCTION DEFINITIONS
@@ -830,7 +834,7 @@ OSCL_EXPORT_REF Int PVMP4AudioDecodeFrame(
          *  This is AAC, but if aac+/eaac+ was declared in the stream, and there is not sbr content
          *  something is wrong
          */
-        if (pMC_Info->sbrPresentFlag || pMC_Info->psPresentFlag)
+        if ((pMC_Info->sbrPresentFlag || pMC_Info->psPresentFlag) && (pExt->aacPlusEnabled == true))
         {
             status = MP4AUDEC_INVALID_FRAME;
         }
@@ -898,7 +902,7 @@ OSCL_EXPORT_REF Int PVMP4AudioDecodeFrame(
 
             if (ch > 0)
             {
-                pns_intensity_right(
+                int ret = pns_intensity_right(
                     pVars->hasmask,
                     pFrameInfo,
                     pChRightShare->group,
@@ -913,6 +917,10 @@ OSCL_EXPORT_REF Int PVMP4AudioDecodeFrame(
                     pChLeftShare->qFormat,
                     pChRightShare->qFormat,
                     &(pVars->pns_cur_noise_state));
+				if(ret != 0) {
+					pMC_Info->nch = 1;
+					return 100;
+				}
             }
 
             if (pChVars[ch]->pShareWfxpCoef->lt_status.ltp_data_present != FALSE)
@@ -1451,6 +1459,1068 @@ OSCL_EXPORT_REF Int PVMP4AudioDecodeFrame(
     pExt->remainderBits = (Int)(pVars->inputStream.usedBits & INBUF_BIT_MODULO_MASK);
 
 
+
+    return (status);
+
+} /* PVMP4AudioDecoderDecodeFrame */
+
+/*----------------------------------------------------------------------------
+; EXTERNAL GLOBAL STORE/BUFFER/POINTER REFERENCES
+; Declare variables used in this module but defined elsewhere
+----------------------------------------------------------------------------*/
+
+/*----------------------------------------------------------------------------
+; FUNCTION CODE
+----------------------------------------------------------------------------*/
+//add by Charle Chen on 2010/02/06 for decode 6 channel
+
+OSCL_EXPORT_REF Int PVMP4AudioDecodeFrameSixChannel(
+    tPVMP4AudioDecoderExternal  *pExt,
+    void                        *pMem)
+{
+    Int            frameLength;      /* Helper variable */
+    Int            ch;
+    Int            id_syn_ele;
+    UInt           initialUsedBits;  /* Unsigned for C55x */
+    Int            qFormatNorm;
+    Int            qPredictedSamples;
+    Bool           leaveGetLoop;
+    MC_Info       *pMC_Info;        /* Helper pointer */
+    FrameInfo     *pFrameInfo;      /* Helper pointer */
+    tDec_Int_File *pVars;           /* Helper pointer */
+    tDec_Int_Chan *pChVars[Chans];  /* Helper pointer */
+
+    per_chan_share_w_fxpCoef *pChLeftShare;  /* Helper pointer */
+    per_chan_share_w_fxpCoef *pChRightShare; /* Helper pointer */
+    Int            status = MP4AUDEC_SUCCESS;
+	Int16 tmpOutput[2048];
+
+    Bool empty_frame;
+
+#ifdef AAC_PLUS
+
+    SBRDECODER_DATA *sbrDecoderData;
+    SBR_DEC         *sbrDec;
+    SBRBITSTREAM    *sbrBitStream;
+#endif
+    /*
+     * Initialize "helper" pointers to existing memory.
+     */
+    pVars = (tDec_Int_File *)pMem;
+
+    pMC_Info = &pVars->mc_info;
+
+#ifdef AAC_PLUS
+
+    sbrDecoderData = (SBRDECODER_DATA *) & pVars->sbrDecoderData;
+    sbrDec         = (SBR_DEC *) & pVars->sbrDec;
+    sbrBitStream   = (SBRBITSTREAM *) & pVars->sbrBitStr;
+
+#ifdef PARAMETRICSTEREO
+    sbrDecoderData->hParametricStereoDec = (HANDLE_PS_DEC) & pVars->sbrDecoderData.ParametricStereoDec;
+#endif
+
+#endif
+    /*
+     * Translate input buffer variables.
+     */
+    pVars->inputStream.pBuffer = pExt->pInputBuffer;
+
+    pVars->inputStream.inputBufferCurrentLength = (UInt)pExt->inputBufferCurrentLength;
+
+    pVars->inputStream.availableBits =
+        (UInt)(pExt->inputBufferCurrentLength << INBUF_ARRAY_INDEX_SHIFT);
+
+    initialUsedBits =
+        (UInt)((pExt->inputBufferUsedLength << INBUF_ARRAY_INDEX_SHIFT) +
+               pExt->remainderBits);
+
+    pVars->inputStream.usedBits = initialUsedBits;
+
+    if (initialUsedBits > pVars->inputStream.availableBits)
+    {
+        status = MP4AUDEC_INVALID_FRAME;
+    }
+    else if (pVars->bno == 0)
+    {
+        /*
+         * Attempt to read in ADIF format first because it is easily identified.
+         * If its not an ADIF bitstream, get_adif_header rewinds the "pointer"
+         * (actually usedBits).
+         */
+        status =
+            get_adif_header(
+                pVars,
+                &(pVars->scratch.scratch_prog_config));
+
+        byte_align(&pVars->inputStream);
+
+        if (status == SUCCESS)
+        {
+            pVars->prog_config.file_is_adts = FALSE;
+        }
+        else  /* we've tried simple audio config, adif, then it should be adts */
+        {
+            pVars->prog_config.file_is_adts = TRUE;
+        }
+    }
+    else if ((pVars->bno == 1) && (pVars->prog_config.file_is_adts == FALSE))
+    {
+
+        /*
+         * There might be an ID_END element following immediately after the
+         * AudioSpecificConfig header. This syntactic element should be read
+         * and byte_aligned before proceeds to decode "real" AAC raw data.
+         */
+        id_syn_ele = (Int)getbits(LEN_SE_ID, &pVars->inputStream) ;
+
+        if (id_syn_ele == ID_END)
+        {
+
+            byte_align(&pVars->inputStream);
+
+            pExt->inputBufferUsedLength =
+                pVars->inputStream.usedBits >> INBUF_ARRAY_INDEX_SHIFT;
+
+            pExt->remainderBits = pVars->inputStream.usedBits & INBUF_BIT_MODULO_MASK;
+
+            pVars->bno++;
+
+            return(status);
+        }
+        else
+        {
+            /*
+             * Rewind bitstream pointer so that the syntactic element can be
+             * read when decoding raw bitstream
+             */
+            pVars->inputStream.usedBits -= LEN_SE_ID;
+        }
+
+    }
+
+    if (pVars->prog_config.file_is_adts == TRUE)
+    {
+        /*
+         *  If file is adts format, let the decoder handle only on data raw
+         *  block at the time, once the last (or only) data block has been
+         *  processed, then synch on the next header
+         */
+        if (pVars->prog_config.headerless_frames)
+        {
+            pVars->prog_config.headerless_frames--;  /* raw data block counter  */
+        }
+        else
+        {
+            status =  get_adts_header(pVars,
+                                      &(pVars->syncword),
+                                      &(pVars->invoke),
+                                      3);     /*   CorrectlyReadFramesCount  */
+
+            if (status != SUCCESS)
+            {
+                status = MP4AUDEC_LOST_FRAME_SYNC;    /*  we lost track of header */
+            }
+        }
+    }
+    else
+    {
+        byte_align(&pVars->inputStream);
+    }
+
+#ifdef AAC_PLUS
+    sbrBitStream->NrElements = 0;
+    sbrBitStream->NrElementsCore = 0;
+
+#endif
+
+    /*
+     * The variable leaveGetLoop is used to signal that the following
+     * loop can be left, which retrieves audio syntatic elements until
+     * an ID_END is found, or an error occurs.
+     */
+    leaveGetLoop = FALSE;
+    empty_frame  = TRUE;
+	UInt16 sceCount = 0;
+	bool sceDecode = false;
+	Int channel = 0;
+    while ((leaveGetLoop == FALSE) && (status == SUCCESS))
+    {
+        /* get audio syntactic element */
+        id_syn_ele = (Int)get9_n_lessbits(LEN_SE_ID, &pVars->inputStream);
+
+        /*
+         *  As fractional frames are a possible input, check that parsing does not
+         *  go beyond the available bits before parsing the syntax.
+         */
+        if (pVars->inputStream.usedBits > pVars->inputStream.availableBits)
+        {
+            status = MP4AUDEC_INCOMPLETE_FRAME; /* possible EOF or fractional frame */
+            id_syn_ele = ID_END;           /* quit while-loop */
+        }
+cpe_decode:
+		if(sceDecode && (id_syn_ele == ID_CPE))
+		{
+			//id_syn_ele = ID_END;
+			//pVars->inputStream.usedBits = pVars->inputStream.availableBits;
+			break;
+		}
+		/*
+		LOGD("id_syn_ele = %d",id_syn_ele);
+		if((sceCount == 2) && (id_syn_ele == ID_CPE))
+		{
+			//id_syn_ele = ID_END;
+			//pVars->inputStream.usedBits = pVars->inputStream.availableBits;
+		}*/
+
+        switch (id_syn_ele)
+        {
+            case ID_END:        /* terminator field */
+                leaveGetLoop = TRUE;
+                break;
+
+
+
+			case ID_SCE:        /* single channel */
+					ALOGI("sce decode");
+					sceDecode = true;
+
+			case ID_CPE:        /* channel pair */
+
+
+			case ID_LFE:        /*low frequry*/
+				if(id_syn_ele == ID_CPE)
+				{
+					ALOGD("cpe decode");
+					channel +=2;
+				}
+
+				else
+					channel++;
+
+				sceCount++;
+                empty_frame = FALSE;
+				if (id_syn_ele == ID_SCE)
+				{
+				  pChVars[LEFT]  = &pVars->perChan[MIDDLE];
+				  pChLeftShare = pChVars[LEFT]->pShareWfxpCoef;
+				}
+				else if((id_syn_ele == ID_CPE) &&(sceCount == 2))
+				{
+				  pChVars[LEFT]  = &pVars->perChan[LEFT];
+				  pChVars[RIGHT] = &pVars->perChan[RIGHT];
+				  pChLeftShare = pChVars[LEFT]->pShareWfxpCoef;
+    			  pChRightShare = pChVars[RIGHT]->pShareWfxpCoef;
+				}
+				else
+				{
+					 pChVars[LEFT]  = &pVars->perChan[BLEFT];
+					 pChVars[RIGHT] = &pVars->perChan[BRIGHT];
+					 pChLeftShare = pChVars[LEFT]->pShareWfxpCoef;
+	    			 pChRightShare = pChVars[RIGHT]->pShareWfxpCoef;
+				}
+				//LOGD("group2 add %d",pChLeftShare->group);
+                status =
+                    huffdecode(
+                        id_syn_ele,
+                        &(pVars->inputStream),
+                        pVars,
+                        pChVars);
+
+#ifdef AAC_PLUS
+                if (id_syn_ele == ID_SCE)
+                {
+                    sbrBitStream->sbrElement[sbrBitStream->NrElements].ElementID = SBR_ID_SCE;
+                }
+                else if (id_syn_ele == ID_CPE)
+                {
+                    sbrBitStream->sbrElement[sbrBitStream->NrElements].ElementID = SBR_ID_CPE;
+                }
+                sbrBitStream->NrElementsCore++;
+
+
+#endif
+
+                break;
+
+            case ID_PCE:        /* program config element */
+                /*
+                 * PCE are not accepted in the middle of a
+                 * raw_data_block. If found, a possible error may happen
+                 * If a PCE is encountered during the first 2 frames,
+                 * it will be read and accepted
+                 * if its tag matches the first, with no error checking
+                 * (inside of get_prog_config)
+                 */
+
+                if (pVars->bno <= 1)
+                {
+                    status = get_prog_config(pVars,
+                                             &(pVars->scratch.scratch_prog_config));
+                }
+                else
+                {
+                    status = MP4AUDEC_INVALID_FRAME;
+                }
+                break;
+
+            case ID_FIL:        /* fill element */
+#ifdef AAC_PLUS
+
+
+                get_sbr_bitstream(sbrBitStream, &pVars->inputStream);
+				sbrBitStream->NrElements = 0;
+
+#else
+                getfill(&pVars->inputStream);
+#endif
+
+                break;
+
+            case ID_DSE:       /* Data Streaming element */
+                get_dse(pVars->share.data_stream_bytes,
+                        &pVars->inputStream);
+                break;
+
+            default: /* Unsupported element, including ID_LFE */
+                status = -1;  /* ERROR CODE needs to be updated */
+                break;
+
+        } /* end switch() */
+
+    } /* end while() */
+	ALOGI("finish switch status %d",status);
+	//for the second out for decode the encode data
+	//first out for decode sce channel.second for decode cpe channel.
+	if(!sceDecode && id_syn_ele == ID_END)
+	{
+		pChVars[LEFT]  = &pVars->perChan[LEFT];
+		pChVars[RIGHT] = &pVars->perChan[RIGHT];
+		pChLeftShare = pChVars[LEFT]->pShareWfxpCoef;
+		pChRightShare = pChVars[RIGHT]->pShareWfxpCoef;
+		byte_align(&pVars->inputStream);
+	}
+
+
+    /*
+     *   After parsing the first frame ( bno=0 (adif), bno=1 (raw))
+     *   verify if implicit signalling is forcing to upsample AAC with
+     *   no AAC+/eAAC+ content. If so, disable upsampling
+     */
+
+#ifdef AAC_PLUS
+    if (pVars->bno <= 1)
+    {
+        if ((pVars->mc_info.ExtendedAudioObjectType == MP4AUDIO_AAC_LC) &&
+                (!sbrBitStream->NrElements))
+        {
+            PVMP4AudioDecoderDisableAacPlus(pExt, pMem);
+        }
+    }
+#endif
+
+    /*
+     *   There might be an empty raw data block with only a
+     *   ID_END element or non audio ID_DSE, ID_FIL
+     *   This is an "illegal" condition but this trap
+     *   avoids any further processing
+     */
+
+    if (empty_frame == TRUE)
+    {
+		ALOGD("return status %d",status);
+		pExt->inputBufferUsedLength =
+            pVars->inputStream.usedBits >> INBUF_ARRAY_INDEX_SHIFT;
+
+        pExt->remainderBits = pVars->inputStream.usedBits & INBUF_BIT_MODULO_MASK;
+
+        pVars->bno++;
+
+        return(status);
+
+    }
+
+#ifdef AAC_PLUS
+
+    if (sbrBitStream->NrElements)
+    {
+        /* for every core SCE or CPE there must be an SBR element, otherwise sths. wrong */
+        if (sbrBitStream->NrElements != sbrBitStream->NrElementsCore)
+        {
+			ALOGI("1111");
+			status = MP4AUDEC_INVALID_FRAME;
+        }
+
+        if (pExt->aacPlusEnabled == false)
+        {
+            sbrBitStream->NrElements = 0;   /* disable aac processing  */
+        }
+    }
+    else
+    {
+        /*
+         *  This is AAC, but if aac+/eaac+ was declared in the stream, and there is not sbr content
+         *  something is wrong
+         */
+        if ((pMC_Info->sbrPresentFlag || pMC_Info->psPresentFlag) && (pExt->aacPlusEnabled == true))
+        {
+			ALOGI("222");
+			status = MP4AUDEC_INVALID_FRAME;
+        }
+    }
+#endif
+
+
+
+
+    /*
+     * Signal processing section.
+     */
+    frameLength = pVars->frameLength;
+
+    if (status == SUCCESS)
+    {
+        /*
+         *   PNS and INTENSITY STEREO and MS
+         */
+
+        pFrameInfo = pVars->winmap[pChVars[LEFT]->wnd];
+		//LOGD("group21 add %d",pChLeftShare->group);
+        pns_left(
+            pFrameInfo,
+            pChLeftShare->group,
+            pChLeftShare->cb_map,
+            pChLeftShare->factors,
+            pChLeftShare->lt_status.sfb_prediction_used,
+            pChLeftShare->lt_status.ltp_data_present,
+            pChVars[LEFT]->fxpCoef,
+            pChLeftShare->qFormat,
+            &(pVars->pns_cur_noise_state));
+		//LOGD("group22 add %d",pChLeftShare->group);
+        /*
+         * apply_ms_synt can only be ran for common windows.
+         * (where both the left and right channel share the
+         * same grouping, window length, etc.
+         *
+         * pVars->hasmask will be > 0 only if
+         * common windows are enabled for this frame.
+         */
+
+        if (pVars->hasmask > 0)
+        {
+            apply_ms_synt(
+                pFrameInfo,
+                pChLeftShare->group,
+                pVars->mask,
+                pChLeftShare->cb_map,
+                pChVars[LEFT]->fxpCoef,
+                pChVars[RIGHT]->fxpCoef,
+                pChLeftShare->qFormat,
+                pChRightShare->qFormat);
+        }
+		//LOGI("1");
+		//if more than 2 channels , force nch = 2 , by Vincent
+		ALOGD("num of channel = %d",pMC_Info->nch);
+		if(sceDecode)//if this is the sce channel , must think it is a channel.
+		{
+			pMC_Info->nch = 1;
+		}
+		else if ((pMC_Info->nch) > 2 )//else the other channel maybe 5channel ,wo only decode the front right and left channel.
+				pMC_Info->nch = 2;
+
+        for (ch = 0; (ch < pMC_Info->nch); ch++)
+        {
+            pFrameInfo = pVars->winmap[pChVars[ch]->wnd];
+
+            /*
+             * Note: This MP4 library assumes that if there are two channels,
+             * then the second channel is right AND it was a coupled channel,
+             * therefore there is no need to check the "is_cpe" flag.
+             */
+
+            if (ch > 0)
+            {
+                pns_intensity_right(
+                    pVars->hasmask,
+                    pFrameInfo,
+                    pChRightShare->group,
+                    pVars->mask,
+                    pChRightShare->cb_map,
+                    pChLeftShare->factors,
+                    pChRightShare->factors,
+                    pChRightShare->lt_status.sfb_prediction_used,
+                    pChRightShare->lt_status.ltp_data_present,
+                    pChVars[LEFT]->fxpCoef,
+                    pChVars[RIGHT]->fxpCoef,
+                    pChLeftShare->qFormat,
+                    pChRightShare->qFormat,
+                    &(pVars->pns_cur_noise_state));
+            }
+
+            if (pChVars[ch]->pShareWfxpCoef->lt_status.ltp_data_present != FALSE)
+            {
+                /*
+                 * LTP - Long Term Prediction
+                 */
+
+                qPredictedSamples = long_term_prediction(
+                                        pChVars[ch]->wnd,
+                                        pChVars[ch]->pShareWfxpCoef->lt_status.
+                                        weight_index,
+                                        pChVars[ch]->pShareWfxpCoef->lt_status.
+                                        delay,
+                                        pChVars[ch]->ltp_buffer,
+                                        pVars->ltp_buffer_state,
+                                        pChVars[ch]->time_quant,
+                                        pVars->share.predictedSamples,      /* Scratch */
+                                        frameLength);
+
+                trans4m_time_2_freq_fxp(
+                    pVars->share.predictedSamples,
+                    pChVars[ch]->wnd,
+                    pChVars[ch]->wnd_shape_prev_bk,
+                    pChVars[ch]->wnd_shape_this_bk,
+                    &qPredictedSamples,
+                    pVars->scratch.fft);   /* scratch memory for FFT */
+
+
+                /*
+                 * To solve a potential problem where a pointer tied to
+                 * the qFormat was being incremented, a pointer to
+                 * pChVars[ch]->qFormat is passed in here rather than
+                 * the address of qPredictedSamples.
+                 *
+                 * Neither values are actually needed in the case of
+                 * inverse filtering, but the pointer was being
+                 * passed (and incremented) regardless.
+                 *
+                 * So, the solution is to pass a space of memory
+                 * that a pointer can happily point to.
+                 */
+
+                /* This is the inverse filter */
+                apply_tns(
+                    pVars->share.predictedSamples,  /* scratch re-used for each ch */
+                    pChVars[ch]->pShareWfxpCoef->qFormat,     /* Not used by the inv_filter */
+                    pFrameInfo,
+                    &(pChVars[ch]->pShareWfxpCoef->tns),
+                    TRUE,                       /* TRUE is FIR */
+                    pVars->scratch.tns_inv_filter);
+
+                /*
+                 * For the next function long_term_synthesis,
+                 * the third param win_sfb_top[], and
+                 * the tenth param coef_per_win,
+                 * are used differently that in the rest of the project. This
+                 * is because originally the ISO code was going to have
+                 * these parameters change as the "short window" changed.
+                 * These are all now the same value for each of the eight
+                 * windows.  This is why there is a [0] at the
+                 * end of each of theses parameters.
+                 * Note in particular that win_sfb_top was originally an
+                 * array of pointers to arrays, but inside long_term_synthesis
+                 * it is now a simple array.
+                 * When the rest of the project functions are changed, the
+                 * structure FrameInfo changes, and the [0]'s are removed,
+                 * this comment could go away.
+                 */
+                long_term_synthesis(
+                    pChVars[ch]->wnd,
+                    pChVars[ch]->pShareWfxpCoef->max_sfb,
+                    pFrameInfo->win_sfb_top[0], /* Look above */
+                    pChVars[ch]->pShareWfxpCoef->lt_status.win_prediction_used,
+                    pChVars[ch]->pShareWfxpCoef->lt_status.sfb_prediction_used,
+                    pChVars[ch]->fxpCoef,   /* input and output */
+                    pChVars[ch]->pShareWfxpCoef->qFormat,   /* input and output */
+                    pVars->share.predictedSamples,
+                    qPredictedSamples,       /* q format for previous aray */
+                    pFrameInfo->coef_per_win[0], /* Look above */
+                    NUM_SHORT_WINDOWS,
+                    NUM_RECONSTRUCTED_SFB);
+
+            } /* end if (pChVars[ch]->lt_status.ltp_data_present != FALSE) */
+
+        } /* for(ch) */
+
+        for (ch = 0; (ch < pMC_Info->nch); ch++)
+        {
+
+            pFrameInfo = pVars->winmap[pChVars[ch]->wnd];
+
+            /*
+             * TNS - Temporal Noise Shaping
+             */
+
+            /* This is the forward filter
+             *
+             * A special note:  Scratch memory is not used by
+             * the forward filter, but is passed in to maintain
+             * common interface for inverse and forward filter
+             */
+            apply_tns(
+                pChVars[ch]->fxpCoef,
+                pChVars[ch]->pShareWfxpCoef->qFormat,
+                pFrameInfo,
+                &(pChVars[ch]->pShareWfxpCoef->tns),
+                FALSE,                   /* FALSE is IIR */
+                pVars->scratch.tns_inv_filter);
+
+            /*
+             * Normalize the q format across all scale factor bands
+             * to one value.
+             */
+            // LOGD("group23 add %d",pChLeftShare->group);
+            qFormatNorm =
+                q_normalize(
+                    pChVars[ch]->pShareWfxpCoef->qFormat,
+                    pFrameInfo,
+                    pChVars[ch]->abs_max_per_window,
+                    pChVars[ch]->fxpCoef);
+			//LOGD("group24 add %d",pChLeftShare->group);
+            /*
+             *  filterbank - converts frequency coeficients to time domain.
+             */
+
+#ifdef AAC_PLUS
+            if (sbrBitStream->NrElements == 0 && pMC_Info->upsamplingFactor == 1)
+            {
+                trans4m_freq_2_time_fxp_2(
+                    pChVars[ch]->fxpCoef,
+                    pChVars[ch]->time_quant,
+                    pChVars[ch]->wnd,   /* window sequence */
+                    pChVars[ch]->wnd_shape_prev_bk,
+                    pChVars[ch]->wnd_shape_this_bk,
+                    qFormatNorm,
+                    pChVars[ch]->abs_max_per_window,
+                    pVars->scratch.fft,
+                    &pExt->pOutputBuffer[ch]);
+                /*
+                 *  Update LTP buffers if needed
+                 */
+					//LOGD("group25 add %d",pChLeftShare->group);
+
+                if (pVars->mc_info.audioObjectType == MP4AUDIO_LTP)
+                {
+                    Int16 * pt = &pExt->pOutputBuffer[ch];
+                    Int16 * ptr = &(pChVars[ch]->ltp_buffer[pVars->ltp_buffer_state]);
+                    Int16  x, y;
+                    for (Int32 i = HALF_LONG_WINDOW; i != 0; i--)
+                    {
+                        x = *pt;
+                        pt += 2;
+                        y = *pt;
+                        pt += 2;
+                        *(ptr++) =  x;
+                        *(ptr++) =  y;
+                    }
+                }
+            }
+            else
+            {
+                trans4m_freq_2_time_fxp_1(
+                    pChVars[ch]->fxpCoef,
+                    pChVars[ch]->time_quant,
+                    &(pChVars[ch]->ltp_buffer[pVars->ltp_buffer_state + 288]),
+                    pChVars[ch]->wnd,   /* window sequence */
+                    pChVars[ch]->wnd_shape_prev_bk,
+                    pChVars[ch]->wnd_shape_this_bk,
+                    qFormatNorm,
+                    pChVars[ch]->abs_max_per_window,
+                    pVars->scratch.fft);
+
+            }
+#else
+
+            trans4m_freq_2_time_fxp_2(
+                pChVars[ch]->fxpCoef,
+                pChVars[ch]->time_quant,
+                pChVars[ch]->wnd,   /* window sequence */
+                pChVars[ch]->wnd_shape_prev_bk,
+                pChVars[ch]->wnd_shape_this_bk,
+                qFormatNorm,
+                pChVars[ch]->abs_max_per_window,
+                pVars->scratch.fft,
+                &pExt->pOutputBuffer[ch]);
+            /*
+             *  Update LTP buffers only if needed
+             */
+
+            if (pVars->mc_info.audioObjectType == MP4AUDIO_LTP)
+            {
+                Int16 * pt = &pExt->pOutputBuffer[ch];
+                Int16 * ptr = &(pChVars[ch]->ltp_buffer[pVars->ltp_buffer_state]);
+                Int16  x, y;
+                for (Int32 i = HALF_LONG_WINDOW; i != 0; i--)
+                {
+                    x = *pt;
+                    pt += 2;
+                    y = *pt;
+                    pt += 2;
+                    *(ptr++) =  x;
+                    *(ptr++) =  y;
+                }
+
+            }
+
+
+#endif
+
+			//LOGD("group26 add %d",pChLeftShare->group);
+            /* Update the window shape */
+            pChVars[ch]->wnd_shape_prev_bk = pChVars[ch]->wnd_shape_this_bk;
+
+        } /* end for() */
+
+
+        /*
+         * Copy to the final output buffer, taking into account the desired
+         * channels from the calling environment, the actual channels, and
+         * whether the data should be interleaved or not.
+         *
+         * If the stream had only one channel, write_output will not use
+         * the right channel data.
+         *
+         */
+
+
+        /* CONSIDER USE OF DMA OPTIMIZATIONS WITHIN THE write_output FUNCTION.
+         *
+         * It is presumed that the ltp_buffer will reside in internal (fast)
+         * memory, while the pExt->pOutputBuffer will reside in external
+         * (slow) memory.
+         *
+         */
+
+
+#ifdef AAC_PLUS
+
+        if (sbrBitStream->NrElements || pMC_Info->upsamplingFactor == 2)
+        {
+
+            if (pVars->bno <= 1)   /* allows console to operate with ADIF and audio config */
+            {
+                if (sbrDec->outSampleRate == 0) /* do it only once (disregarding of signaling type) */
+                {
+                    sbr_open(samp_rate_info[pVars->mc_info.sampling_rate_idx].samp_rate,
+                             sbrDec,
+                             sbrDecoderData,
+                             pVars->mc_info.bDownSampledSbr);
+                }
+
+            }
+            pMC_Info->upsamplingFactor =
+                sbrDecoderData->SbrChannel[0].frameData.sbr_header.sampleRateMode;
+
+
+            /* reuse right aac spectrum channel  */
+            {
+                Int16 *pt_left  =  &(pChVars[LEFT ]->ltp_buffer[pVars->ltp_buffer_state]);
+                Int16 *pt_right =  &(pChVars[RIGHT]->ltp_buffer[pVars->ltp_buffer_state]);
+
+                if (sbr_applied(sbrDecoderData,
+                                sbrBitStream,
+                                pt_left,
+                                pt_right,
+                                pExt->pOutputBuffer,
+                                sbrDec,
+                                pVars,
+                                pMC_Info->nch) != SBRDEC_OK)
+                {
+                    status = MP4AUDEC_INVALID_FRAME;
+                }
+            }
+
+
+        }  /*  if( pExt->aacPlusEnabled == FALSE) */
+#endif
+
+        /*
+         * Copied mono data in both channels or just leave it as mono,
+         * according with desiredChannels (default is 2)
+         */
+
+        if (pExt->desiredChannels == 2)
+        {
+
+#if defined(AAC_PLUS)
+#if defined(PARAMETRICSTEREO)&&defined(HQ_SBR)
+            if (pMC_Info->nch != 2 && pMC_Info->psPresentFlag != 1)
+#else
+            if (pMC_Info->nch != 2)
+#endif
+#else
+            if (pMC_Info->nch != 2)
+#endif
+            {
+                /* mono */
+
+
+                Int16 * pt  = &pExt->pOutputBuffer[0];
+                Int16 * pt2 = &pExt->pOutputBuffer[1];
+                Int i;
+                if (pMC_Info->upsamplingFactor == 2)
+                {
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2 = *pt;
+                        pt += 2;
+                        pt2 += 2;
+                    }
+                    pt  = &pExt->pOutputBuffer_plus[0];
+                    pt2 = &pExt->pOutputBuffer_plus[1];
+
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2 = *pt;
+                        pt += 2;
+                        pt2 += 2;
+                    }
+                }
+                else
+                {
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2 = *pt;
+                        pt += 2;
+                        pt2 += 2;
+                    }
+                }
+
+            }
+
+#if defined(AAC_PLUS)
+#if defined(PARAMETRICSTEREO)&&defined(HQ_SBR)
+
+            else if (pMC_Info->psPresentFlag == 1)
+            {
+                Int32 frameSize = 0;
+                if (pExt->aacPlusEnabled == false)
+                {
+                    /*
+                     *  Decoding eaac+ when only aac is enabled, copy L into R
+                     */
+                    frameSize = 1024;
+                }
+                else if (sbrDecoderData->SbrChannel[0].syncState != SBR_ACTIVE)
+                {
+                    /*
+                     *  Decoding eaac+ when no PS data was found, copy upsampled L into R
+                     */
+                    frameSize = 2048;
+                }
+
+                Int16 * pt  = &pExt->pOutputBuffer[0];
+                Int16 * pt2 = &pExt->pOutputBuffer[1];
+                Int i;
+                for (i = 0; i < frameSize; i++)
+                {
+                    *pt2 = *pt;
+                    pt += 2;
+                    pt2 += 2;
+                }
+            }
+#endif
+#endif
+
+        }
+        else
+        {
+
+#if defined(AAC_PLUS)
+#if defined(PARAMETRICSTEREO)&&defined(HQ_SBR)
+            if (pMC_Info->nch != 2 && pMC_Info->psPresentFlag != 1)
+#else
+            if (pMC_Info->nch != 2)
+#endif
+#else
+            if (pMC_Info->nch != 2)
+#endif
+            {
+                /* mono */
+                Int16 * pt  = &pExt->pOutputBuffer[0];
+                Int16 * pt2 = &pExt->pOutputBuffer[0];
+                Int i;
+
+                if (pMC_Info->upsamplingFactor == 2)
+                {
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2++ = *pt;
+                        pt += 2;
+                    }
+
+                    pt  = &pExt->pOutputBuffer_plus[0];
+                    pt2 = &pExt->pOutputBuffer_plus[0];
+
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2++ = *pt;
+                        pt += 2;
+                    }
+                }
+                else
+                {
+                    for (i = 0; i < 1024; i++)
+                    {
+                        *pt2++ = *pt;
+                        pt += 2;
+                    }
+                }
+
+            }
+
+        }
+
+		if((id_syn_ele != ID_END)&& sceDecode)//when first decode the sce channel ,will be back for get the other channel data
+		{
+				Int16 * pt  = &pExt->pOutputBuffer[0];
+                Int16 * pt2 = tmpOutput;
+                Int i;
+                for (i = 0; i < pVars->frameLength; i++)
+                {
+                    *pt2 = *pt;
+                    pt += 2;
+                    pt2 ++;
+                }
+				sceDecode = false;
+				//pMC_Info->nch = channel;
+				ALOGD("return to cpe_decode");
+				goto cpe_decode;
+		}
+
+		ALOGD("channel  = %d framelen = %d",channel,pVars->frameLength);
+		if(channel > 2)//when we find this is more than two channel ,wo must mix the sce and first cpe channel data.
+
+		{
+			Int16 * pt  = &pExt->pOutputBuffer[0];
+			Int16 * pt1  = &pExt->pOutputBuffer[1];
+            Int16 * pt2 = tmpOutput;
+            Int i;
+            for (i = 0; i < pVars->frameLength; i++)
+            {
+                pt[2*i] = (pt[2*i]>>1)+(pt2[i]>>1);
+				pt1[2*i] = (pt1[2*i]>>1)+(pt2[i]>>1);
+            }
+		}
+        /* pVars->ltp_buffer_state cycles between 0 and 1024.  The value
+         * indicates the location of the data corresponding to t == -2.
+         *
+         * | t == -2 | t == -1 |  pVars->ltp_buffer_state == 0
+         *
+         * | t == -1 | t == -2 |  pVars->ltp_buffer_state == 1024
+         *
+         */
+
+#ifdef AAC_PLUS
+        if (sbrBitStream->NrElements == 0 && pMC_Info->upsamplingFactor == 1)
+        {
+            pVars->ltp_buffer_state ^= frameLength;
+        }
+        else
+        {
+            pVars->ltp_buffer_state ^= (frameLength + 288);
+        }
+#else
+        pVars->ltp_buffer_state ^= frameLength;
+#endif
+
+
+        if (pVars->bno <= 1)
+        {
+            /*
+             * to set these values only during the second call
+             * when they change.
+             */
+            pExt->samplingRate =
+                samp_rate_info[pVars->mc_info.sampling_rate_idx].samp_rate;
+
+            pVars->mc_info.implicit_channeling = 0; /* disable flag, as this is allowed
+                                                      * only the first time
+                                                      */
+
+
+#ifdef AAC_PLUS
+
+            if (pMC_Info->upsamplingFactor == 2)
+            {
+                pExt->samplingRate *= pMC_Info->upsamplingFactor;
+                pExt->aacPlusUpsamplingFactor = pMC_Info->upsamplingFactor;
+            }
+
+#endif
+
+            pExt->extendedAudioObjectType = pMC_Info->ExtendedAudioObjectType;
+            pExt->audioObjectType = pMC_Info->audioObjectType;
+
+            pExt->encodedChannels = pMC_Info->nch;
+            pExt->frameLength = pVars->frameLength;
+        }
+
+        pVars->bno++;
+
+
+        /*
+         * Using unit analysis, the bitrate is a function of the sampling rate, bits,
+         * points in a frame
+         *
+         *     bits        samples                frame
+         *     ----  =    --------- *  bits  *   -------
+         *     sec           sec                  sample
+         *
+         * To save a divide, a shift is used. Presently only the value of
+         * 1024 is used by this library, so make it the most accurate for that
+         * value. This may need to be updated later.
+         */
+
+        pExt->bitRate = (pExt->samplingRate *
+                         (pVars->inputStream.usedBits - initialUsedBits)) >> 10;  /*  LONG_WINDOW  1024 */
+
+        pExt->bitRate >>= (pMC_Info->upsamplingFactor - 1);
+
+
+    } /* end if (status == SUCCESS) */
+
+
+    if (status != MP4AUDEC_SUCCESS)
+    {
+        /*
+         *  A non-SUCCESS decoding could be due to an error on the bitstream or
+         *  an incomplete frame. As access to the bitstream beyond frame boundaries
+         *  are not allowed, in those cases the bitstream reading routine return a 0
+         *  Zero values guarantees that the data structures are filled in with values
+         *  that eventually will signal an error (like invalid parameters) or that allow
+         *  completion of the parsing routine. Either way, the partial frame condition
+         *  is verified at this time.
+         */
+        if (pVars->prog_config.file_is_adts == TRUE)
+        {
+            status = MP4AUDEC_LOST_FRAME_SYNC;
+            pVars->prog_config.headerless_frames = 0; /* synchronization forced */
+        }
+        else
+        {
+            /*
+             *  Check if the decoding error was due to buffer overrun, if it was,
+             *  update status
+             */
+            if (pVars->inputStream.usedBits > pVars->inputStream.availableBits)
+            {
+                /* all bits were used but were not enough to complete decoding */
+                pVars->inputStream.usedBits = pVars->inputStream.availableBits;
+
+                status = MP4AUDEC_INCOMPLETE_FRAME; /* possible EOF or fractional frame */
+            }
+        }
+    }
+
+    /*
+     * Translate from units of bits back into units of words.
+     */
+
+    pExt->inputBufferUsedLength =
+        pVars->inputStream.usedBits >> INBUF_ARRAY_INDEX_SHIFT;
+
+    pExt->remainderBits = (Int)(pVars->inputStream.usedBits & INBUF_BIT_MODULO_MASK);
 
     return (status);
 

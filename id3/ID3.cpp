@@ -493,7 +493,8 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
             id->setTo(tmp);
             return;
         }
-
+		uint8_t * data = (uint8_t * )mFrameData;
+		data[mFrameSize-1] = '\0';
         convertISO8859ToString8(frameData, mFrameSize, id);
         return;
     }
@@ -510,13 +511,18 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         }
         n -= skipped;
     }
+	if(n < 0)
+		n = 0;
 
     if (encoding == 0x00) {
         // ISO 8859-1
         convertISO8859ToString8(frameData + 1, n, id);
     } else if (encoding == 0x03) {
         // UTF-8
-        id->setTo((const char *)(frameData + 1), n);
+        //add by Charles chen for notify mediascanner this info is utf-8 type
+		String8 value("rkutf8");
+		value.append((const char *)(frameData + 1), n);
+        id->setTo(value.string(),n+6);
     } else if (encoding == 0x02) {
         // UTF-16 BE, no byte order mark.
         // API wants number of characters, not number of bytes...
@@ -540,7 +546,9 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         int len = n / 2;
         const char16_t *framedata = (const char16_t *) (frameData + 1);
         char16_t *framedatacopy = NULL;
+		bool isUCS2 = false;
         if (*framedata == 0xfffe) {
+			isUCS2 = true;
             // endianness marker doesn't match host endianness, convert
             framedatacopy = new char16_t[len];
             for (int i = 0; i < len; i++) {
@@ -550,10 +558,14 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         }
         // If the string starts with an endianness marker, skip it
         if (*framedata == 0xfeff) {
+			isUCS2 = true;
             framedata++;
             len--;
         }
+		if(isUCS2)
         id->setTo(framedata, len);
+		else//if not is UCS-2, fixed it ISO8859
+			convertISO8859ToString8(frameData + 1, n, id);
         if (framedatacopy != NULL) {
             delete[] framedatacopy;
         }

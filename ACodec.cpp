@@ -499,15 +499,25 @@ status_t ACodec::allocateOutputBuffersFromNativeWindow() {
         return err;
     }
 
+    android_native_rect_t crop;
+    crop.left = 0;
+    crop.top = 0;
+    crop.right = def.format.video.nFrameWidth & (~3); //if no 4 aglin crop csy
+    crop.bottom = def.format.video.nFrameHeight;
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
-            def.format.video.nFrameWidth,
-            def.format.video.nFrameHeight,
+            (def.format.video.nFrameWidth + 15)&(~15),
+            (def.format.video.nFrameHeight + 15)&(~15),
             def.format.video.eColorFormat);
 
     if (err != 0) {
         ALOGE("native_window_set_buffers_geometry failed: %s (%d)",
                 strerror(-err), -err);
+        return err;
+    }
+    err = native_window_set_crop(mNativeWindow.get(), &crop);
+    if (err != 0) {
+        ALOGE("native_window_set_cropfailed: %s (%d)",strerror(-err), -err);
         return err;
     }
 
@@ -766,10 +776,6 @@ status_t ACodec::setComponentRole(
     static const MimeToRole kMimeToRole[] = {
         { MEDIA_MIMETYPE_AUDIO_MPEG,
             "audio_decoder.mp3", "audio_encoder.mp3" },
-        { MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_I,
-            "audio_decoder.mp1", "audio_encoder.mp1" },
-        { MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_II,
-            "audio_decoder.mp2", "audio_encoder.mp2" },
         { MEDIA_MIMETYPE_AUDIO_AMR_NB,
             "audio_decoder.amrnb", "audio_encoder.amrnb" },
         { MEDIA_MIMETYPE_AUDIO_AMR_WB,
@@ -1353,11 +1359,11 @@ status_t ACodec::setSupportedOutputFormat() {
     CHECK_EQ(err, (status_t)OK);
     CHECK_EQ((int)format.eCompressionFormat, (int)OMX_VIDEO_CodingUnused);
 
-    CHECK(format.eColorFormat == OMX_COLOR_FormatYUV420Planar
+  /*  CHECK(format.eColorFormat == OMX_COLOR_FormatYUV420Planar
            || format.eColorFormat == OMX_COLOR_FormatYUV420SemiPlanar
            || format.eColorFormat == OMX_COLOR_FormatCbYCrY
            || format.eColorFormat == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar
-           || format.eColorFormat == OMX_QCOM_COLOR_FormatYVU420SemiPlanar);
+           || format.eColorFormat == OMX_QCOM_COLOR_FormatYVU420SemiPlanar);*/
 
     return mOMX->setParameter(
             mNode, OMX_IndexParamVideoPortFormat,
@@ -2553,6 +2559,11 @@ void ACodec::BaseState::onInputBufferFilled(const sp<AMessage> &msg) {
                 } else {
                     ALOGV("[%s] calling emptyBuffer %p w/ time %lld us",
                          mCodec->mComponentName.c_str(), bufferID, timeUs);
+                   if(!strncmp("OMX.rk.", mCodec->mComponentName.c_str(), 7)){
+                        Mutex::Autolock autoLock(mCodec->mLock);
+                        ALOGV("push timeUs = %lld",timeUs);
+                        mCodec->mTimeStamp.push(timeUs);
+                   }
                 }
 
                 CHECK_EQ(mCodec->mOMX->emptyBuffer(
@@ -2667,28 +2678,143 @@ bool ACodec::BaseState::onOMXFillBufferDone(
         case RESUBMIT_BUFFERS:
         {
             if (rangeLength == 0 && !(flags & OMX_BUFFERFLAG_EOS)) {
-                ALOGV("[%s] calling fillBuffer %p",
+                    ALOGV("[%s] calling fillBuffer %p",
                      mCodec->mComponentName.c_str(), info->mBufferID);
 
-                CHECK_EQ(mCodec->mOMX->fillBuffer(
+                    CHECK_EQ(mCodec->mOMX->fillBuffer(
                             mCodec->mNode, info->mBufferID),
                          (status_t)OK);
 
-                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
-                break;
-            }
-
-            if (!mCodec->mIsEncoder && !mCodec->mSentFormat) {
-                mCodec->sendFormatChange();
+                    info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+					break;
+                }
+                if(flags & OMX_BUFFERFLAG_DATACORRUPT){
+                    Mutex::Autolock autoLock(mCodec->mLock);
+                    if(!strncmp("OMX.rk.", mCodec->mComponentName.c_str(), 7)){
+                        int32_t index = 0, i = 0;
+                        if(mCodec->mTimeStamp.size()> 1){
+                            int64_t minTimeStamp = mCodec->mTimeStamp.editItemAt(0);
+                            for(i = 1;i< mCodec->mTimeStamp.size();i++){
+                                int64_t curTimeStamp = mCodec->mTimeStamp.editItemAt(i);
+                                if(curTimeStamp < minTimeStamp){
+                                    minTimeStamp = curTimeStamp;
+                                    index = i;
+                                }
+                            }
+                        }
+                        if(mCodec->mTimeStamp.size()){
+                            timeUs = mCodec->mTimeStamp.editItemAt(index);
+                            mCodec->mTimeStamp.removeAt(index);
+                            if(timeUs == mCodec->mLastTime){
+                                mCodec->mNumSameFrame++;
+                            }else{
+                                if(mCodec->mNumFrame < 100){
+                                    if(timeUs - mCodec->mLastTime < 80000){
+                                        mCodec->mDealtTime += (timeUs - mCodec->mLastTime);
+                                        mCodec->mNumFrame++;
+                                    }
+                                }else{
+                                    if(!mCodec->mDealtFlag){
+                                        mCodec->mDealtFlag = true;
+                                        mCodec->mDealtTime = mCodec->mDealtTime/mCodec->mNumFrame;
+                                        ALOGI("mCodec->mDealtTime = %d", mCodec->mDealtTime);
+                                        if(mCodec->mDealtTime/1000 > 58){
+                                            mCodec->mDealtTime = 66666; //15fps
+                                        }else if(mCodec->mDealtTime/1000 > 35){
+                                            mCodec->mDealtTime = 40000; //25fps
+                                        }else if(mCodec->mDealtTime/1000 > 25){
+                                            mCodec->mDealtTime = 33333; //30fps
+                                        }else{
+                                            mCodec->mDealtTime = 16666; //60fps
+                                        }
+                                    }
+                                }
+                            }
+                            mCodec->mLastTime = timeUs;
+                            ALOGV("skip error frame timeUs %lld",timeUs);
+                        }
+                    }
+                }
+			
+           if (!mCodec->mIsEncoder && !mCodec->mSentFormat) {
+                    mCodec->sendFormatChange();
             }
 
             if (mCodec->mNativeWindow == NULL) {
                 info->mData->setRange(rangeOffset, rangeLength);
             }
-
-            if (mCodec->mSkipCutBuffer != NULL) {
+			if (mCodec->mSkipCutBuffer != NULL) {
                 mCodec->mSkipCutBuffer->submit(info->mData);
             }
+                if(!strncmp("OMX.rk.", mCodec->mComponentName.c_str(), 7)){
+                    Mutex::Autolock autoLock(mCodec->mLock);
+                    int32_t index = 0, i = 0;
+                    if(!mCodec->mFirstFrameFlag){
+                        for(i = mCodec->mTimeStamp.size()-1;i >= 0;i--){
+                            int64_t curTimeStamp = mCodec->mTimeStamp.editItemAt(i);
+                            if(curTimeStamp < timeUs){
+                               mCodec->mTimeStamp.removeAt(i);
+                            }
+                        }
+                        mCodec->mFirstFrameFlag = true;
+                    }
+                    if(mCodec->mTimeStamp.size()> 1){
+                        int64_t minTimeStamp = mCodec->mTimeStamp.editItemAt(0);
+                        for(i = 1;i< mCodec->mTimeStamp.size();i++){
+                            int64_t curTimeStamp = mCodec->mTimeStamp.editItemAt(i);
+                            if(curTimeStamp < minTimeStamp){
+                                minTimeStamp = curTimeStamp;
+                                index = i;
+                            }
+                        }
+                    }
+                    if(mCodec->mTimeStamp.size()){
+                        timeUs = mCodec->mTimeStamp.editItemAt(index);
+                        mCodec->mTimeStamp.removeAt(index);
+                        ALOGV("timeUs = %lld",timeUs);
+                    }else{
+                        timeUs = mCodec->mLastTime;
+                    }
+                    if(timeUs == mCodec->mLastTime){
+                        if(mCodec->mNumFrame >= 50 && mCodec->mDealtFlag){
+                            mCodec->mNumSameFrame++;
+                            mCodec->mDealtTimeToTal = mCodec->mDealtTime*mCodec->mNumSameFrame;
+                            ALOGV("mCodec->mDealtTime = %d", mCodec->mDealtTime);
+                        }else{
+                            mCodec->mNumSameFrame++;
+                        }
+                    }else{
+                         if(mCodec->mNumFrame < 50){
+                            if(timeUs - mCodec->mLastTime < 80000 && timeUs > mCodec->mLastTime){
+                                mCodec->mDealtTime += (timeUs - mCodec->mLastTime);
+                                mCodec->mNumFrame++;
+                            }
+                         }else{
+                             if(!mCodec->mDealtFlag){
+                                mCodec->mDealtFlag = true;
+                                mCodec->mDealtTime = mCodec->mDealtTime/mCodec->mNumFrame;
+                                ALOGI("mCodec->mDealtTime = %d", mCodec->mDealtTime);
+                                if(mCodec->mDealtTime/1000 > 58){
+                                    mCodec->mDealtTime = 66666; //15fps
+                                }else if(mCodec->mDealtTime/1000 > 35){
+                                    mCodec->mDealtTime = 40000; //25fps
+                                }else if(mCodec->mDealtTime/1000 > 25){
+                                    mCodec->mDealtTime = 33333; //30fps
+                                }else{
+                                    mCodec->mDealtTime = 16666; //60fps
+                                }
+                            }
+                         }
+                    }
+                    mCodec->mLastTime = timeUs;
+                    if(!mCodec->mDealtFlag && mCodec->mNumFrame){
+                        mCodec->mDealtTimeToTal = mCodec->mNumSameFrame*mCodec->mDealtTime/mCodec->mNumFrame;
+                    }
+                    timeUs += mCodec->mDealtTimeToTal;
+                    ALOGV("video timeUs = %lld,mCodec->mDealtTimeToTal = %lld",timeUs,mCodec->mDealtTimeToTal);
+                }else{
+                    ALOGV("Auido timeUs = %lld",timeUs);
+                }
             info->mData->meta()->setInt64("timeUs", timeUs);
 
             sp<AMessage> notify = mCodec->mNotify->dup();
@@ -2905,8 +3031,14 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         }
         matchingCodecQuirks.push_back(quirks);
     } else {
+//add by csy for video used hardware decoder 2012.7.14
         CHECK(msg->findString("mime", &mime));
 
+        int32_t flags = OMXCodec::kHardwareCodecsOnly;
+        if(!strncasecmp(mime.c_str(), "audio/", 6))
+        {
+            flags = OMXCodec::kSoftwareCodecsOnly;
+        }
         int32_t encoder;
         if (!msg->findInt32("encoder", &encoder)) {
             encoder = false;
@@ -2916,7 +3048,7 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
                 mime.c_str(),
                 encoder, // createEncoder
                 NULL,  // matchComponentName
-                0,     // flags
+                flags,     // flags
                 &matchingCodecs,
                 &matchingCodecQuirks);
     }
@@ -3101,6 +3233,14 @@ bool ACodec::LoadedState::onConfigureComponent(
                 mCodec->mNativeWindow.get(),
                 NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
     }
+    mCodec->mTimeStamp.clear();
+    mCodec->mFirstFrameFlag = false;
+    mCodec->mLastTime = 0;
+    mCodec->mDealtTime= 0;
+    mCodec->mDealtFlag = false;
+    mCodec->mDealtTimeToTal = 0;
+    mCodec->mNumFrame = 0;
+    mCodec->mNumSameFrame = 0;
     CHECK_EQ((status_t)OK, mCodec->initNativeWindow());
 
     {
@@ -3376,6 +3516,14 @@ bool ACodec::ExecutingState::onOMXEvent(
                 mCodec->freeOutputBuffersNotOwnedByComponent();
 
                 mCodec->changeState(mCodec->mOutputPortSettingsChangedState);
+                mCodec->mTimeStamp.clear();
+                mCodec->mFirstFrameFlag = false;
+                mCodec->mLastTime = 0;
+                mCodec->mDealtTime= 0;
+                mCodec->mDealtFlag = false;
+                mCodec->mDealtTimeToTal = 0;
+                mCodec->mNumFrame = 0;
+                mCodec->mNumSameFrame = 0;
             } else if (data2 == OMX_IndexConfigCommonOutputCrop) {
                 mCodec->mSentFormat = false;
             } else {

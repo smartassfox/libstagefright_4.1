@@ -122,8 +122,13 @@ status_t FileSource::getSize(off64_t *size) {
         return NO_INIT;
     }
 
-    *size = mLength;
+    if (mLength >= 0) {
+        *size = mLength;
 
+        return OK;
+    }
+
+    *size = lseek64(mFd, 0, SEEK_END);
     return OK;
 }
 

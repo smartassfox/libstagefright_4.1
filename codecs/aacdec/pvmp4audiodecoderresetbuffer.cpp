@@ -132,6 +132,9 @@
 ----------------------------------------------------------------------------*/
 #define LEFT  (0)
 #define RIGHT (1)
+#define MIDDLE (2)
+#define BLEFT (3)
+#define BRIGHT (4)
 
 /*----------------------------------------------------------------------------
 ; LOCAL FUNCTION DEFINITIONS
@@ -188,6 +191,17 @@ OSCL_EXPORT_REF void PVMP4AudioDecoderResetBuffer(void  *pMem)
     pv_memset(pVars->perChan[RIGHT].time_quant,
               0,
               LONG_WINDOW*sizeof(pVars->perChan[RIGHT].time_quant[0]));
+#ifdef MIDDLE_CHANNLE
+	pv_memset(pVars->perChan[MIDDLE].time_quant,
+              0,
+              LONG_WINDOW*sizeof(pVars->perChan[MIDDLE].time_quant[0]));
+	pv_memset(pVars->perChan[BLEFT].time_quant,
+              0,
+              LONG_WINDOW*sizeof(pVars->perChan[BLEFT].time_quant[0]));
+	pv_memset(pVars->perChan[BRIGHT].time_quant,
+              0,
+              LONG_WINDOW*sizeof(pVars->perChan[BRIGHT].time_quant[0]));
+#endif
 
 
 #ifdef AAC_PLUS

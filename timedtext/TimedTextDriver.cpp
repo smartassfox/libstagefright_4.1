@@ -242,4 +242,13 @@ void TimedTextDriver::getExternalTrackInfo(Parcel *parcel) {
     }
 }
 
+int32_t TimedTextDriver::getCurFrameDuration()
+{
+    if (mPlayer !=NULL) {
+        return mPlayer->getCurFrameDuration();
+    } else {
+        return 0;
+    }
+}
+
 }  // namespace android

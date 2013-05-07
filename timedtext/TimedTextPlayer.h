@@ -43,6 +43,10 @@ public:
     void seekToAsync(int64_t timeUs);
     void setDataSource(sp<TimedTextSource> source);
 
+    int32_t getCurFrameDuration(){
+        return mCurSubFrmDurMs;
+    }
+
 protected:
     virtual void onMessageReceived(const sp<AMessage> &msg);
 
@@ -63,6 +67,8 @@ private:
     wp<MediaPlayerBase> mListener;
     sp<TimedTextSource> mSource;
     int32_t mSendSubtitleGeneration;
+
+    int32_t  mCurSubFrmDurMs;
 
     void doSeekAndRead(int64_t seekTimeUs);
     void doRead(MediaSource::ReadOptions* options = NULL);

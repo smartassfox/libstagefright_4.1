@@ -49,6 +49,7 @@ struct LiveSession : public AHandler {
     void seekTo(int64_t timeUs);
 
     status_t getDuration(int64_t *durationUs);
+    status_t getCurrentTime(int64_t *CurrenttimeUs);
     bool isSeekable();
 
 protected:
@@ -58,8 +59,8 @@ protected:
 
 private:
     enum {
-        kMaxNumQueuedFragments = 3,
-        kMaxNumRetries         = 5,
+        kMaxNumQueuedFragments = 6,
+        kMaxNumRetries         = 25,
     };
 
     enum {
@@ -99,7 +100,10 @@ private:
     Mutex mLock;
     Condition mCondition;
     int64_t mDurationUs;
+    int64_t mCurrenttimeUs;
     bool mSeekDone;
+    bool mSeekFlag;
+    bool mNeedDecrypt;
     bool mDisconnectPending;
 
     int32_t mMonitorQueueGeneration;

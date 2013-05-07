@@ -82,7 +82,7 @@
 ; GLOBAL FUNCTION DEFINITIONS
 ; Function Prototype declaration
 ----------------------------------------------------------------------------*/
-void pns_intensity_right(
+Int pns_intensity_right(
     const Int        hasmask,
     const FrameInfo * const pFrameInfo,
     const Int        group[],

@@ -185,7 +185,7 @@ extern "C"
          */
         tDec_Int_Chan  perChan[Chans];
 
-        Int32          fxpCoef[2][LN];         /* LN  = 2048     */
+        Int32		   fxpCoef[Chans][LN];         /* LN  = 2048     */
 
 
 

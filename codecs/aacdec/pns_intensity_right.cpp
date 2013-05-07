@@ -386,7 +386,7 @@
 ; FUNCTION CODE
 ----------------------------------------------------------------------------*/
 
-void pns_intensity_right(
+int pns_intensity_right(
     const Int        hasmask,
     const FrameInfo * const pFrameInfo,
     const Int        group[],
@@ -424,6 +424,7 @@ void pns_intensity_right(
     Int     sfb_per_win;
     Int     wins_in_group;
     Int     win_indx;
+	Int     cBands = 0;
 
     const Int16 *pBand;
     const Int   *pFactorsLeft  = factorsL;
@@ -481,6 +482,9 @@ void pns_intensity_right(
 
         for (sfb = sfb_per_win; sfb > 0; sfb--)
         {
+        	cBands++;
+			if(cBands >= MAXBANDS)
+				return -1;
             /* band is offset table, band_stop is last coef in band */
             band_stop = *(pBand++);
 
@@ -646,7 +650,7 @@ void pns_intensity_right(
 
     /* pFrameInfo->num_win = 1 for long windows, 8 for short_windows */
 
-    return;
+    return 0;
 
 } /* pns_intensity_right() */
 
